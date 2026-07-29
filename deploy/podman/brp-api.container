@@ -1,0 +1,49 @@
+# Quadlet unit for node2 (Rocky, Podman). Rootless.
+#
+# Install to:  ~/.config/containers/systemd/brp-api.container
+# Then:        systemctl --user daemon-reload && systemctl --user start brp-api
+#
+# Quadlet is Podman's systemd-native deployment. It generates a real
+# brp-api.service from this file at daemon-reload, so the container is managed
+# by systemd like any other service. This is the piece that makes the container
+# survive a reboot: Podman is daemonless, so `podman run --restart` alone has
+# nothing watching to restart it after boot. systemd is that watcher.
+#
+# Rootless (runs as the ericratz user, not root) because that is Podman's whole
+# security proposition on RHEL, and the app only needs port 8000 (>1024), which
+# rootless can bind without privilege. Port 80 belongs to host nginx, not this
+# container, so nothing here needs root.
+#
+# REQUIRES lingering, or the unit stops when you log out:
+#   sudo loginctl enable-linger ericratz
+# Without it, systemctl --user services only run while a login session for the
+# user exists — fine interactively, gone the moment SSH closes.
+
+[Unit]
+Description=BRP FastAPI reliability service
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=localhost/brp-api:latest
+ContainerName=brp-api
+PublishPort=8000:8000
+
+# The one file that differs between nodes. Same NODE_NAME/APP_VERSION/PROM_URL
+# contract as node1's compose, from the same .env, so both nodes are configured
+# identically in shape.
+EnvironmentFile=%h/bare-metal-reliability-platform/.env
+
+# journald so the health monitor's `journalctl` checks can read app logs next
+# to OS logs. Podman's default is journald anyway; stated for parity with the
+# compose file and so it is not silently changed by a config default.
+LogDriver=journald
+
+[Service]
+# Restart policy lives here (systemd), not in the container — the daemonless
+# point again. always: bring it back on crash and on boot.
+Restart=always
+TimeoutStartSec=90
+
+[Install]
+WantedBy=default.target

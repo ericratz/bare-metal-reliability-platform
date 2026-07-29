@@ -1,0 +1,16 @@
+.git/
+.github/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+#deployment + test assets run on the host, never inside the image
+deploy/
+k6/
+scripts/
+docs/
+evidence/
+reports/
+*.md
+.env

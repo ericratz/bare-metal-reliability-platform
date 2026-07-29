@@ -1,0 +1,75 @@
+#/etc/prometheus/prometheus.yml
+#
+#IDENTICAL on both nodes. Each node runs its own Prometheus, and both scrape
+#the same targets — which is the actual recommended Prometheus HA pattern.
+#There is no clustering to configure and no shared storage: you simply run two,
+#and each is independently complete. If one node is lost you still have full
+#metrics on the other, with a gap only for the lost node's own series.
+#
+#Consequence worth knowing: the two instances are not synchronised, so their
+#numbers can differ by up to one scrape interval. That is expected, not drift.
+#
+#Running Prometheus on both also lets PROM_URL be 127.0.0.1:9090 everywhere, so
+#/slo never crosses the network — see README on why that coupling mattered.
+#
+#No Grafana: at two nodes the expression browser plus the Alerts tab covers it,
+#and Grafana's baseline RAM is not worth spending here.
+
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+  external_labels:
+    platform: bare-metal
+    #Set per node so the two instances are distinguishable if their data is
+    #ever compared side by side. THIS IS THE ONE LINE THAT DIFFERS BETWEEN
+    #NODES — set it to node2 on node2.
+    replica: node1
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+#No alertmanager block. Alert rules still evaluate and surface under Status >
+#Rules and the Alerts tab; they just do not route anywhere. Deferred, not
+#forgotten — see README "Deferred".
+
+scrape_configs:
+  #Scraped per node by IP, deliberately NOT through the load balancer or the
+  #VIP. Going through the LB would round-robin the scrape between instances and
+  #produce one series that silently alternates between two machines, making
+  #per-node comparison impossible.
+  #
+  #Hardware is identical, so the meaningful label is the OS — that is the only
+  #variable left, and therefore the only thing a per-node difference can be
+  #attributed to.
+  - job_name: brp-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['192.168.71.251:8000']
+        labels:
+          node: node1
+          os: ubuntu-26.04
+      - targets: ['192.168.71.252:8000']
+        labels:
+          node: node2
+          os: rocky-10.2
+
+  #Both Prometheus instances, scraped by both Prometheus instances. Cheap, and
+  #it means each one can alert on the other being down.
+  - job_name: prometheus
+    static_configs:
+      - targets: ['192.168.71.251:9090']
+        labels:
+          node: node1
+          os: ubuntu-26.04
+      - targets: ['192.168.71.252:9090']
+        labels:
+          node: node2
+          os: rocky-10.2
+
+  #Nginx runs on both nodes (keepalived floats the VIP between them), so both
+  #are scraped. Requires the stub_status endpoint and an exporter; left
+  #commented until that is deployed rather than shipping a config that makes
+  #targets show as permanently DOWN.
+  #- job_name: nginx
+  #  static_configs:
+  #    - targets: ['192.168.71.251:9113', '192.168.71.252:9113']

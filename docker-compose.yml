@@ -1,0 +1,26 @@
+#Identical on node1 (Ubuntu) and node2 (Rocky). Everything that differs between
+#the two nodes lives in .env, so the deployed tree stays byte-for-byte the same
+#across both distros — that sameness is what makes the rolling update a matter
+#of swapping a tag rather than reconciling two hand-maintained configs.
+services:
+  api:
+    build:
+      context: .
+      args:
+        APP_VERSION: ${APP_VERSION:-dev}
+    image: brp-api:${APP_VERSION:-dev}
+    container_name: brp-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      #no default: an instance that does not know which node it is on would
+      #report "unknown" to the LB, Prometheus, and the health monitor at once.
+      NODE_NAME: ${NODE_NAME:?NODE_NAME must be set - copy .env.example to .env}
+      APP_VERSION: ${APP_VERSION:-dev}
+      PROM_URL: ${PROM_URL:-http://127.0.0.1:9090}
+    #journald on the nodes so the health monitor's `journalctl -t brp-api`
+    #check can read app logs alongside OS logs. Defaults to json-file so the
+    #stack still comes up on a dev box without systemd.
+    logging:
+      driver: ${LOG_DRIVER:-json-file}

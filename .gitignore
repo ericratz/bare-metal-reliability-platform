@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+#per-node config: NODE_NAME differs between node1 and node2
+.env
+
+#rolling-update evidence logs (regenerated per run, can get large)
+evidence/
+reports/

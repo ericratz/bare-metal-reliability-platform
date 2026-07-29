@@ -1,0 +1,91 @@
+#/etc/prometheus/rules/slo.rules.yml
+
+groups:
+  - name: brp-availability
+    rules:
+      #up{} comes from the scrape itself, so this fires even when the app is
+      #too broken to report anything — unlike any metric the app emits.
+      - alert: NodeScrapeDown
+        expr: up{job="brp-api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.node }} has not been scrapeable for 2m"
+          description: "Expected during a rolling update. Unexpected otherwise — check `docker ps` and `systemctl status docker` on {{ $labels.node }}."
+
+      #Both nodes gone at once is a different problem from one node gone, and
+      #wants a different response, so it gets its own alert rather than two
+      #copies of the one above.
+      - alert: AllNodesDown
+        expr: count(up{job="brp-api"} == 1) == 0
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: "No brp-api instance is reachable — full outage"
+
+  - name: brp-slo
+    rules:
+      #clamp_min on the denominator avoids divide-by-zero on an idle fleet, but
+      #it is not free: below 1 req/s it deflates the ratio (0.1 req/s all
+      #failing reads as 10%, not 100%). That is a deliberate trade — it keeps
+      #a homelab that is idle overnight from paging on a single stray 500 —
+      #but it means these numbers are only trustworthy under load, i.e. during
+      #the k6 runs they exist to measure.
+      - record: brp:error_rate:ratio5m
+        expr: |
+          sum(rate(brp_requests_total{status=~"5.."}[5m]))
+          /
+          clamp_min(sum(rate(brp_requests_total[5m])), 1)
+
+      - record: brp:availability:ratio5m
+        expr: 1 - brp:error_rate:ratio5m
+
+      - record: brp:latency:p95_5m
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum(rate(brp_request_duration_seconds_bucket[5m])) by (le)
+          )
+
+      #per-node p95, which is the number that actually drives upstream weights
+      - record: brp:latency:p95_5m:by_node
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum(rate(brp_request_duration_seconds_bucket[5m])) by (le, node)
+          )
+
+      - alert: HighErrorRate
+        expr: brp:error_rate:ratio5m > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Error rate {{ $value | humanizePercentage }} over 5m (SLO: <5%)"
+
+      - alert: HighLatencyP95
+        expr: brp:latency:p95_5m > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 latency {{ $value }}s over 5m (SLO: <500ms)"
+
+      #Catches the failure mode the fleet-wide p95 hides: node2 degrading badly
+      #while node1's larger share of traffic keeps the aggregate under target.
+      #scalar() rather than `on() group_left` vector matching: the right side is
+      #a single label-less value, so collapsing it to a scalar sidesteps the
+      #matching rules entirely and reads as what it is — compare each node
+      #against a number.
+      - alert: NodeLatencySkew
+        expr: |
+          brp:latency:p95_5m:by_node
+            >
+          scalar(avg(brp:latency:p95_5m:by_node)) * 3
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.node }} p95 is >3x the fleet average — check its upstream weight"
