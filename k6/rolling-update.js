@@ -6,7 +6,7 @@ import { Counter } from 'k6/metrics';
 //substantiates or kills the zero-downtime claim, so its thresholds are
 //absolute: a single failed request fails the run.
 //
-//  k6 run -e BASE_URL=http://192.168.71.250 -e DURATION=10m k6/rolling-update.js
+//  k6 run -e BASE_URL=http://192.168.71.245 -e DURATION=10m k6/rolling-update.js
 //
 //Start this BEFORE step 1 of RUNBOOK.md and let it run past the final step.
 

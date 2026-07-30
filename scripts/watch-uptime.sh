@@ -11,8 +11,8 @@
 # against the runbook step you were performing.
 #
 #   ./scripts/watch-uptime.sh                          # defaults to localhost
-#   ./scripts/watch-uptime.sh http://192.168.71.250/health
-#   INTERVAL=0.1 ./scripts/watch-uptime.sh http://192.168.71.250/health
+#   ./scripts/watch-uptime.sh http://192.168.71.245/health
+#   INTERVAL=0.1 ./scripts/watch-uptime.sh http://192.168.71.245/health
 #
 # Ctrl-C to stop and print the summary.
 #

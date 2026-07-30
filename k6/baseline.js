@@ -7,7 +7,7 @@ import { Rate, Counter, Trend } from 'k6/metrics';
 //splits between the two nodes so the upstream weights can be set from data
 //instead of guessed from clock speeds.
 //
-//  k6 run -e BASE_URL=http://192.168.71.250 k6/baseline.js
+//  k6 run -e BASE_URL=http://192.168.71.245 k6/baseline.js
 
 const errorRate   = new Rate('errors');
 const nodeHits    = new Counter('node_hits');

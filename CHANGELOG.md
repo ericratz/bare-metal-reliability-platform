@@ -2,6 +2,97 @@
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed
+
+- **VIP moved from `192.168.71.250` to `192.168.71.245`.** `.250` was already
+  held by an appliance at `d8:44:89:a0:66:60` — it answers ARP and 404s
+  `/health`, which is why early monitor runs reported the VIP unreachable. The
+  0.1.0 entry below records `.250` as chosen and is left as written; this is
+  the correction, not a retcon. `.245` verified unanswered via `ip neigh` from
+  both nodes, and sits in the same high-subnet static band as `.251`/`.252`.
+- `deploy/nginx/brp.conf` now documents at length why `/health` is **not**
+  special-cased. Pinning it to the local app was written and then reverted
+  before shipping: every evidence tool in this repo attributes a request to a
+  node by reading the `node` field out of a `/health` response, so pinning
+  reduces `watch-uptime.sh`, `k6/baseline.js` and `k6/rolling-update.js` to a
+  single node — silently, since the field is still present and merely never
+  changes. Bypassing the upstream also disables `proxy_next_upstream`, which
+  is the actual zero-downtime mechanism, so a node drained by `pool.sh` would
+  keep answering `/health` from its own restarting container and manufacture
+  the dropped requests `rolling-update.js` exists to detect.
+
+  The concern behind the idea is legitimate and belongs one layer down: a
+  consumer asking "is THIS node healthy" must ask the app directly on `:8000`,
+  not through the load balancer whose job is to hide which node answered.
+  "node-local" in the README endpoint table describes the data, not the
+  routing.
+- `location = /report` serves the health monitor's HTML report as a static
+  file from `/var/www/health/`, allow-listed to the nodes rather than the LAN.
+  Not proxied: a report about a node's health must not depend on that node's
+  app tier, and through the upstream it could be answered by the other node.
+
+  The directory is created setgid — `root:www-data` on node1, `root:nginx` on
+  node2, mode `2750`. The monitor writes the report `0640` so local accounts
+  cannot read it, which means nginx needs group access, and since the file is
+  rewritten every cycle a one-off `chgrp` does not survive. Wrong group gives
+  a 403 rather than a 404, which distinguishes it from "not yet written."
+
+### Added
+
+- `RUNBOOK.md` §1 now registers each component with the health monitor as part
+  of the step that deploys it. `HEALTH_SERVICES` and `HEALTH_APP_ENDPOINTS`
+  start trimmed to what exists, so the monitor's exit code is meaningful from
+  the first run instead of sitting at a standing WARNING until the platform is
+  finished. The tradeoff is stated in place: an unregistered component is
+  unwatched and nothing reports that fact.
+- `deploy/systemd/health-monitor-node{1,2}.conf` — per-node drop-ins for
+  `health-monitor.service.d/10-fleet.conf`, filling a directory that was empty.
+  Installed with only the baseline entries active; every later entry is
+  pre-written, commented, and tagged with the `RUNBOOK.md` step that enables
+  it, so registration is "move the active line down one" rather than composing
+  a config from memory four separate times. A drop-in rather than a unit edit,
+  because the unit is replaced on the monitor's next install.
+
+  node2's carries the trap explicitly: `brp-api` must **not** go in
+  `HEALTH_SERVICES`, since a rootless Quadlet user unit is invisible to
+  system-level `systemctl --failed` and would register as permanently
+  not-installed — a standing WARNING that never clears.
+
+  Both files, and `RUNBOOK.md` §1, carry a **drop-in collision check**. The
+  monitor's repo ships its own per-node drop-ins for the same unit, systemd
+  merges every `*.conf` in the directory, and last writer wins in
+  lexicographic order — where digits precede letters, so `10-fleet.conf` loses
+  to `nodeN.conf`. The failure is silent: the file you edited is present,
+  correct, and ignored, and the trim is quietly replaced by the shipped end
+  state. Resolved by checking the merged result
+  (`systemctl show -p Environment`) rather than reasoning about filenames,
+  since a rename in either repo would otherwise flip precedence unannounced.
+
+### Known gaps
+
+- **`.245` is confirmed free at layer 2 only.** The router's admin UI is not
+  available, so it cannot be proven outside the DHCP pool. Accepted on the
+  evidence that `.250`/`.251`/`.252` already coexist with DHCP at the top of
+  the `/22`, and on RFC 2131 §4.3.1 — a conforming server probes before
+  offering, and keepalived answers ARP continuously, so the address defends
+  itself while the platform is up. The exposure window is both nodes being
+  down simultaneously for long enough to be leased away.
+
+  This is mitigated by detection, not prevention: the health monitor's
+  `answered_by` on the VIP names the responding MAC every cycle, so a
+  collision surfaces in one interval rather than as months of intermittent
+  symptoms. `RUNBOOK.md` §1e records both nodes' MACs so that check is
+  actionable. Revisit if router access is ever obtained.
+- **The report path is set by overriding `ExecStart` in the drop-in**, which
+  pins the whole command line — a future upstream change to the monitor's
+  `ExecStart` would be silently discarded. Every other setting in the drop-in
+  is an `Environment=` line and has no such problem. The fix belongs on the
+  monitor's side: an env var for the report path would let that block be
+  deleted. Until then, re-diff the drop-in against `systemctl cat` after any
+  monitor upgrade.
+
 ## [0.1.0] — 2026-07-29
 
 Initial port. The FastAPI service, Prometheus metrics, SLO definitions, failure

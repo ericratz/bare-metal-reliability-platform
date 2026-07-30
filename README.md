@@ -22,7 +22,7 @@ them; whichever node holds it serves ingress, the other is warm and ready.
 There is no dedicated load-balancer node and no single point of failure.
 
 ```
-                     VIP  192.168.71.250   (floats via VRRP)
+                     VIP  192.168.71.245   (floats via VRRP)
                                 │
                 ┌───────────────┴────────────────┐
         node1  MASTER (prio 110)          node2  BACKUP (prio 100)
@@ -203,7 +203,9 @@ Detailed, OS-specific steps — including the ufw / firewalld / SELinux plumbing
 are in [RUNBOOK.md](RUNBOOK.md). In outline:
 
 **Both nodes:** clone the repo, `cp .env.example .env`, set `NODE_NAME`.
-`.env` is gitignored and is the only file that differs between the two nodes.
+`.env` is gitignored and is the only file you *write* per node — the repo also
+ships per-node variants you pick between rather than edit (`keepalived-nodeN.conf`,
+`health-monitor-nodeN.conf`).
 
 **node1 (Ubuntu / Docker):**
 ```bash
@@ -226,10 +228,10 @@ some. All traffic goes at the **VIP**, not a node IP.
 
 ```bash
 # terminal A — every request, timestamped, with the node that served it
-./scripts/watch-uptime.sh http://192.168.71.250/health
+./scripts/watch-uptime.sh http://192.168.71.245/health
 
 # terminal B — 20 req/s, zero-failure threshold
-k6 run -e BASE_URL=http://192.168.71.250 -e DURATION=15m k6/rolling-update.js
+k6 run -e BASE_URL=http://192.168.71.245 -e DURATION=15m k6/rolling-update.js
 
 # terminal C — perform RUNBOOK.md
 ```
@@ -254,6 +256,8 @@ app/                     FastAPI service (ported, cloud deps stripped)
 deploy/nginx/            LB config; upstream split out so a deploy edits one file
 deploy/prometheus/       scrape config + SLO recording and alerting rules
 deploy/keepalived/       VRRP config for both nodes + health-check / notify scripts
+deploy/podman/           node2 Quadlet unit — what makes the container reboot-safe
+deploy/systemd/          health-monitor drop-ins; doubles as the registration checklist
 k6/baseline.js           normal-condition load; reports traffic split by node
 k6/rolling-update.js     zero-failure-threshold load for the rollout window
 scripts/pool.sh          add/remove a node from the nginx pool, syntax-checked
@@ -266,17 +270,25 @@ RUNBOOK.md               rolling-update and failover procedures
 ## Status
 
 Verified locally: app port, container build, Prometheus config + rules
-(`promtool`-validated), nginx config (`nginx -t`-validated), `pool.sh` (15
-tests), `watch-uptime.sh` (7 tests incl. injected-outage detection). Both nodes
-provisioned with static IPs and their container runtimes.
+(`promtool`-validated), `pool.sh` (15 tests), `watch-uptime.sh` (7 tests incl.
+injected-outage detection). Both nodes provisioned with static IPs and their
+container runtimes.
+
+**linux-health-monitor v3.2 is deployed and running as a timer on both nodes**
+— currently the only part of this platform that exists on real hardware. Both
+nodes report WARNING, which is correct: they are running none of the services
+they are configured to watch. `RUNBOOK.md` §1 trims that configuration to what
+actually exists and grows it as each component lands, so the exit code is worth
+reading during the deploy rather than only after it.
 
 Pending:
 
 - [ ] Deploy the stack to both nodes (app, nginx, Prometheus, keepalived)
 - [ ] node2 Podman Quadlet unit
-- [ ] Firewall + SELinux configuration per node
+- [ ] Firewall + SELinux per node — node2 still needs `8000/tcp` and VRRP
 - [ ] Rolling update and VIP failover executed and measured on real hardware
-- [ ] Health monitor v3.0 deployed as a systemd timer
+- [ ] `nginx -t` against the current `brp.conf` — the `/report` block postdates
+      the last validation; §1c gates `systemctl enable --now` on it
 
 Deferred: Alertmanager routing (rules evaluate and display in Prometheus's UI,
 they just do not notify anywhere yet).
