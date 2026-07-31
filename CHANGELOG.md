@@ -38,6 +38,31 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   cannot read it, which means nginx needs group access, and since the file is
   rewritten every cycle a one-off `chgrp` does not survive. Wrong group gives
   a 403 rather than a 404, which distinguishes it from "not yet written."
+- **`RUNBOOK.md` §1a: VRRP cannot be opened with `ufw`.** The node1 block ran
+  `ufw allow from <peer> proto vrrp`, which ufw rejects — its `proto` keyword
+  accepts only `ah`, `esp`, `gre`, `igmp`, `ipv6`, `tcp`, `udp`, with no
+  numeric-protocol form. Replaced with an `ufw-before-input -p 112` rule in
+  `/etc/ufw/before.rules`, plus the `iptables -S` check that is the only way to
+  confirm it — `ufw status` does not list `before.rules` content.
+
+  Recorded as a portability finding rather than a typo: firewalld expresses
+  this in one flag and ufw cannot express it at all. It is the sharpest
+  instance so far of the thesis that the OS is the variable, and the failure it
+  would have produced — blocked adverts, both nodes claiming the VIP — is the
+  one §1a's own warning calls the most common keepalived bring-up failure.
+- **`RUNBOOK.md` §1a enabled ufw on node1 with no SSH rule.** ufw defaults to
+  deny-incoming and ships with nothing allowed, so `ufw --force enable` closed
+  port 22 on a headless, minimized box — and `--force` is precisely what
+  suppresses ufw's own "may disrupt existing ssh connections" prompt. The
+  failure is delayed rather than immediate: the current session survives on the
+  ESTABLISHED rule, so the lockout only appears at the next login, when
+  physical access is the only remedy. Now allows `22/tcp` before enabling, with
+  a verification step to run while a working session is still open.
+
+  The same OS-variable pattern as the VRRP finding, inverted: firewalld ships
+  `ssh` permitted in its default zone, so node2 was never exposed to this. The
+  two firewalls disagree about what a fresh install should permit, and the
+  runbook had been written as though they agreed.
 
 ### Added
 

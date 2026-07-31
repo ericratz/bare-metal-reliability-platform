@@ -119,14 +119,87 @@ Traffic that must be allowed:
 | VRRP (proto 112) | the other node | keepalived adverts |
 
 **node1 (Ubuntu, ufw):**
+
+> ### Allow SSH first, or you will lock yourself out of a headless node
+>
+> ufw's default policy is **deny incoming**, and it ships with nothing
+> allowed — so enabling it without an SSH rule closes port 22. `--force`
+> exists specifically to suppress ufw's own *"Command may disrupt existing ssh
+> connections. Proceed?"* prompt, which is the guard that would otherwise stop
+> you here.
+>
+> The damage is delayed and therefore easy to miss: your **current** session
+> survives on the ESTABLISHED rule, so nothing appears wrong. The lockout only
+> shows up at the next login, on a minimized box with no desktop — physical
+> access is the way back.
+>
+> node2 needed no equivalent because firewalld ships `ssh` in its default zone
+> (visible as `services: cockpit dhcpv6-client ssh` in its `--list-all`). ufw
+> ships nothing. Same intent, opposite defaults.
+
 ```bash
+# ufw is not guaranteed present — this image is minimized, which is also why
+# arping was missing earlier
+command -v ufw || sudo apt-get install -y ufw
+
+# SSH BEFORE ENABLE. Not optional, not reorderable.
+sudo ufw allow 22/tcp
+
 sudo ufw allow 80/tcp
 sudo ufw allow from 192.168.68.0/22 to any port 8000 proto tcp
 sudo ufw allow from 192.168.68.0/22 to any port 9090 proto tcp
-# VRRP is not a TCP/UDP port — allow the protocol to the peer
-sudo ufw allow from 192.168.71.252 proto vrrp
 sudo ufw --force enable && sudo ufw status verbose
 ```
+
+Confirm `22/tcp ALLOW IN` appears in the `status verbose` output **before you
+close the session** — while you still have a working connection to fix it
+from. Once that is verified you can narrow it to
+`sudo ufw allow from 192.168.68.0/22 to any port 22 proto tcp` and delete the
+broad rule; do it in that order, never the reverse.
+
+**VRRP cannot be expressed as a `ufw allow` rule at all.** ufw's `proto`
+keyword accepts only `ah`, `esp`, `gre`, `igmp`, `ipv6`, `tcp` and `udp` —
+there is no `vrrp` keyword and no numeric-protocol form, so
+`ufw allow from <peer> proto vrrp` is rejected rather than silently ignored.
+firewalld's `--add-protocol=vrrp` simply has no ufw counterpart, and this is
+the one place the two nodes' firewalls are not merely spelled differently.
+
+It has to go in the raw iptables rules ufw loads ahead of its own chains:
+
+```bash
+sudoedit /etc/ufw/before.rules
+```
+
+Add these lines inside the `*filter` section — anywhere after
+`# End required lines` and before the closing `COMMIT`:
+
+```
+# VRRP (IP protocol 112) — keepalived adverts from the peer
+-A ufw-before-input -p 112 -s 192.168.71.252 -j ACCEPT
+```
+
+> **node1 has no editor.** The minimized Ubuntu image ships no `vi`, `nano` or
+> `ed`, so `sudoedit` fails with `failed to run editor /usr/bin/vi`. Either
+> `sudo apt-get install -y nano` first, or apply it without one — this anchors
+> on a marker present in every stock `before.rules`, and keeps a rollback:
+>
+> ```bash
+> sudo cp /etc/ufw/before.rules /etc/ufw/before.rules.bak
+> sudo awk '/^# End required lines/{print; print ""; print "# VRRP (IP protocol 112) — keepalived adverts from the peer"; print "-A ufw-before-input -p 112 -s 192.168.71.252 -j ACCEPT"; next} 1' /etc/ufw/before.rules.bak | sudo tee /etc/ufw/before.rules >/dev/null
+> ```
+>
+> Third missing tool on this image after `arping` and `ufw` — assume nothing is
+> installed here and check before depending on it.
+
+```bash
+sudo ufw reload
+sudo iptables -S ufw-before-input | grep 112
+```
+
+The `grep` must return the rule. `ufw status` will **never** show it — that
+only lists ufw's own rules, not `before.rules` — so this is the only
+confirmation you get, and its absence is exactly the silent VRRP block that
+produces split brain at §1e.
 
 **node2 (Rocky, firewalld):**
 ```bash
