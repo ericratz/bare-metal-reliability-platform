@@ -82,8 +82,21 @@ systemctl show health-monitor.service -p Environment --no-pager | tr ' ' '\n' | 
 ```
 
 Expect exactly one `.conf`, and `HEALTH_SERVICES` showing the trimmed baseline
-— not the shipped end state. If a second drop-in is present, remove it: this
-file is authoritative for `HEALTH_SERVICES`, `HEALTH_APP_ENDPOINTS` and
+— not the shipped end state. A name ending `.disabled` is inert; the drop-in
+glob is `*.conf` and does not match it.
+
+**If a second drop-in is present, read it before deleting it.** It may carry
+settings this file does not, including non-`Environment=` directives — node2's
+original `node2.conf` set `ProtectHome=no`, which `HEALTH_CONTAINER_USER`
+requires to work at all. Absorb anything node-specific into this file, then
+remove the other one. Deleting blind trades a loud collision for a silent gap.
+
+Expect the override to be *partial*, which is the shape that fools you: on
+node2 the second drop-in won `HEALTH_SERVICES` while `HEALTH_APP_ENDPOINTS`
+and `HEALTH_VIP` still came from this file, so the file looked like it was
+working. Read the merged values, never the file you last edited.
+
+This file is authoritative for `HEALTH_SERVICES`, `HEALTH_APP_ENDPOINTS` and
 `HEALTH_VIP` for as long as the platform is being deployed, because it is the
 only one that knows which components exist yet.
 
