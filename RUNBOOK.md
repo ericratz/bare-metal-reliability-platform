@@ -632,13 +632,31 @@ systemctl --user restart brp-api
 **Verify on both before registering:**
 
 ```bash
-curl -s http://127.0.0.1:8000/slo | jq '{status, availability_percent}'
+curl -s http://127.0.0.1:8000/slo | jq
 ```
 
-`status` must not be `unavailable`. Note what a correct-but-idle answer looks
-like, so it is not mistaken for a fault: an empty query result yields per-metric
-defaults (availability `1.0`), *not* nulls — unreachable and empty are
-deliberately distinct, and only unreachable produces nulls.
+`status` must not be `unavailable`. That is the whole gate — the numbers are
+not part of it.
+
+Note what a correct-but-idle answer looks like under 0.2.0, so it is not
+mistaken for a fault. With no traffic, every metric is `null` and named in
+`no_data`, and `status` is still `ok`:
+
+```json
+{ "status": "ok", "node": "node1", "window": "2m",
+  "availability_percent": null, "p95_latency_ms": null,
+  "no_data": ["availability_percent", "p95_latency_ms"] }
+```
+
+That is the endpoint working. `null` here means "nothing has been served in the
+last two minutes", which at this point in the deploy is true and expected. An
+unreachable Prometheus looks entirely different — `status: unavailable`, and
+the metric keys are absent rather than null.
+
+> If you are following this runbook on a node still running `0.1.0`, the idle
+> answer is `availability_percent: 100.0` instead — a fabricated number this
+> check used to instruct you to accept. That is the defect `0.2.0` fixes; see
+> `CHANGELOG.md`.
 
 **Register.** Add `prometheus.service` to `HEALTH_SERVICES`, and this node's
 `http://127.0.0.1:8000/slo` (the `fleet-slo` entry) to `HEALTH_APP_ENDPOINTS`
@@ -868,18 +886,70 @@ with `pool.sh` rather than trusted to be noticed.
 - [ ] Both in the pool: `sudo ./scripts/pool.sh status` → both `[IN ]`
 - [ ] New image built on both nodes (or built once and `podman/docker save | ssh … load`)
 - [ ] Nothing else deploying
+- [ ] k6 installed on node2 — see below, it is not in Rocky's base repos
+- [ ] You know what the new version *is*. 0.2.0 is the `/slo` no-data fix; see
+      `CHANGELOG.md`. Step 5 gates on `version` changing, so a rebuild with no
+      version bump passes the health check while proving nothing.
+
+#### Installing k6 on node2
+
+Not packaged for Rocky 10. Static binary from the upstream release, same
+pattern as Prometheus in §1d — and with the same caveat: **no distro security
+updates, upgrades are manual.** Acceptable here because k6 is an operator tool
+run by hand, not a service listening on anything.
+
+```bash
+ssh ericratz@192.168.71.252
+K6_VERSION=$(curl -fsSL https://api.github.com/repos/grafana/k6/releases/latest | jq -r .tag_name)
+echo "$K6_VERSION"     # sanity-check it looks like v1.2.3 before continuing
+curl -fsSL "https://github.com/grafana/k6/releases/download/${K6_VERSION}/k6-${K6_VERSION}-linux-amd64.tar.gz" -o /tmp/k6.tar.gz
+tar -xzf /tmp/k6.tar.gz -C /tmp
+sudo install -m 0755 "/tmp/k6-${K6_VERSION}-linux-amd64/k6" /usr/local/bin/k6
+sudo restorecon -v /usr/local/bin/k6
+k6 version
+```
+
+If the download 404s, check the asset name on the releases page — the archive
+layout is upstream's to change, and this is the one step here that depends on it.
 
 ### Step 0 — start evidence collection (before touching anything)
 
+**Both of these run on node2, not on your workstation.** They drive traffic at
+the VIP, and the workstation is NAT'd off the lab LAN — it cannot reach
+`192.168.71.245` at all. Two SSH sessions to node2:
+
 ```bash
+ssh ericratz@192.168.71.252
+cd ~/bare-metal-reliability-platform
+mkdir -p evidence      # k6 writes its summary here at exit and will not create it
+
 # terminal A
 ./scripts/watch-uptime.sh http://192.168.71.245/health
 # terminal B
-k6 run -e BASE_URL=http://192.168.71.245 -e DURATION=15m k6/rolling-update.js
+k6 run -e BASE_URL=http://192.168.71.245 -e MAX_VUS=50 -e DURATION=15m k6/rolling-update.js
 ```
+
+> **The load generator is also one of the backends under test.** There is no
+> third machine on the lab LAN, so this is a constraint, not a choice. node2 is
+> the less bad of the two: node1 holds the VIP *and* is the nginx every request
+> passes through, so generating load there would put the client, the balancer,
+> the VRRP master and a backend on one 2-core box.
+>
+> What it costs: node2's share of `p95_latency_ms` includes whatever k6 itself
+> is consuming, so **per-node latency from this run is not a clean number** and
+> should not be quoted as one. What it does *not* cost: the zero-dropped-requests
+> claim, which is a count of failed responses and is indifferent to which host
+> asked. `MAX_VUS=50` caps the ceiling so a latency blip cannot escalate into a
+> self-inflicted load spike — see the comment in `k6/rolling-update.js`.
 
 Both must still be running at the end. If either started late or died, the run
 proves nothing — restart from here.
+
+Leave these two sessions alone for the rest of the procedure. Every `ssh
+ericratz@192.168.71.252` below is a *third* session — do not reuse terminal A
+or B, and note that step 4 restarts the app container on the very node these
+are running from. That is fine: they are pointed at the VIP on node1, which
+serves them from node1's backend while node2's is down.
 
 ### Step 1 — record starting versions
 
@@ -943,7 +1013,22 @@ version is broken, you find out now, while node1 still runs the old one.
 
 ### Step 7 — repeat for node1
 
-Same sequence, `pool.sh down node1` … update … `pool.sh up node1`.
+Same sequence — drain, confirm zero, update, health-check direct, return to the
+pool — but the update command itself is not the same, because node1 runs Docker
+Compose rather than a Quadlet:
+
+```bash
+ssh ericratz@192.168.71.251      # a new session; leave node2's terminals A and B alone
+cd ~/bare-metal-reliability-platform
+sed -i 's/^APP_VERSION=.*/APP_VERSION=0.2.0/' .env
+# docker-compose.yml reads ${APP_VERSION} for BOTH the build-arg and the runtime
+# environment, so the one edit above covers what node2 needed two mechanisms for.
+docker compose up -d --build
+docker compose ps                # STATUS must reach (healthy), not just Up
+```
+
+Then step 5's direct health check against `192.168.71.251:8000`, and
+`pool.sh up node1`.
 
 > **VIP interaction.** node1 holds the VIP. `pool.sh down node1` only removes it
 > from the *upstream* — it keeps serving as the LB. But when you restart node1's
@@ -978,13 +1063,28 @@ Roll back the node you just touched **before** proceeding to the other.
 
 ## 3. VIP failover drills
 
-These prove the HA layer works and, more usefully, *measure* it. Run
-`./scripts/watch-uptime.sh http://192.168.71.245/health` throughout each, and
-tail the transitions:
+These prove the HA layer works and, more usefully, *measure* it.
+
+**Run the watcher from node2, for the same reason as §2 step 0** — it targets
+the VIP, and the workstation cannot reach it. node2 is also the only correct
+choice here regardless: every drill below takes node1 down in some fashion, and
+a watcher running on the node you are about to power off measures nothing.
+
+```bash
+# on node2, for the whole of every drill
+./scripts/watch-uptime.sh http://192.168.71.245/health
+```
+
+Tail the transitions on **both** nodes at once — a failover is two half-events,
+one node standing down and the other taking over, and the interesting failures
+are the ones where only half happens:
 
 ```bash
 journalctl -t keepalived-notify -f
 ```
+
+Timestamps from the two nodes are directly comparable: `notify.sh` now emits an
+identical format on both, which it did not before §1e — see `CHANGELOG.md`.
 
 ### Drill A — graceful nginx stop on the master
 

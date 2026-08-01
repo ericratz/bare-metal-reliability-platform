@@ -295,6 +295,99 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`systemctl show -p Environment`) rather than reasoning about filenames,
   since a rename in either repo would otherwise flip precedence unannounced.
 
+### Fixed
+
+*This is what `0.2.0` carries.* §2 proves a rolling update by showing `version`
+change per node, so it needs a version with something in it; the honest
+candidate was the defect §1d exposed and the README has been carrying as a
+pending item ever since.
+
+- **`/slo` reported `availability_percent: 100.0` for a fleet that had served
+  almost nothing.** `safe_query()` took a per-metric `default` and returned it
+  whenever Prometheus answered with an empty result, and `get_availability()`
+  passed `default=1.0` on the reasoning that no series yet means nothing has
+  failed yet. True, and still the wrong thing to publish: the response could
+  not distinguish a measured 100% from an idle window, and what it chose to
+  show was the flattering reading. A fabricated SLO is worse than an absent
+  one — an absent one prompts a question, a fabricated one reads as evidence,
+  and this one sat on the dashboard for the whole of §1.
+
+  `safe_query()` now returns a third value, `NO_DATA`, distinct from both a
+  float and the `None` that means Prometheus is unreachable. `/slo` renders it
+  as an explicit `null` and names the affected metrics in a `no_data` array, so
+  "no traffic in this window" is something the response states rather than
+  something you have to know to infer.
+
+- **The empty-result path was reached during healthy traffic, not just idle
+  traffic** — which is why the wrong default went unnoticed for so long.
+  `sum(rate(brp_requests_total{status=~"5.."}[2m]))` over a selector matching
+  nothing yields an empty vector rather than a zero, and empty propagates
+  through the whole expression, so *any* window with no 5xx returned nothing at
+  all. `default=1.0` was silently standing in for the healthy case as well as
+  the idle one, and the two were about to become indistinguishable in exactly
+  the run meant to measure them. The 5xx term is now `… or vector(0)`, leaving
+  one thing that can empty the expression: no requests at all.
+
+- **A quiet window produced invalid JSON, not just a misleading number.**
+  `histogram_quantile()` over a histogram with no observations returns NaN;
+  `float('nan')` passed straight through to the encoder, which emits a bare
+  `NaN` token. That is not JSON — a strict parser rejects the entire document,
+  not the one field, so `curl … | jq` on `/slo` failed outright rather than
+  showing a null p95. Non-finite values are now folded into `NO_DATA` at the
+  query boundary, where the string forms Prometheus actually sends (`"NaN"`,
+  `"+Inf"`) are still visible; `float()` accepts all of them without complaint,
+  so the check has to happen after the conversion.
+
+- **`/slo`'s own docstring was the last copy of the corrected claim.** The
+  `PROM_URL` entry above says it corrects "the 0.1.0 entry below and the
+  README" — it missed the code. The docstring still said `/slo` queries node1's
+  Prometheus so both instances return the same numbers, which describes a
+  design that was never built. Now states what actually happens: the numbers
+  are fleet-wide because Prometheus sums across both nodes' targets, while the
+  query stays node-local so no single instance's loss takes `/slo` down
+  everywhere. Worth more than a typo fix — a docstring is where the next person
+  looks before the changelog, and this one contradicted the deployment.
+
+- **`scripts/watch-uptime.sh` was committed non-executable**, while `pool.sh`
+  was not. §2 step 0 and all of §3 invoke it as `./scripts/watch-uptime.sh`, so
+  the first command of the first evidence-gathering step would have failed with
+  a permission error on both nodes. Local-only artifact of how the file was
+  created; invisible on the workstation because it had never been run from a
+  fresh clone.
+
+`status` deliberately stays `"ok"` when Prometheus answers but every metric is
+null. It reports whether the endpoint could do its job, not whether traffic
+happened to be flowing — the health monitor gates on that field, and a quiet
+night is not a fault. Changing it would have turned an idle fleet into a failed
+monitor run, which is the opposite of the point.
+
+Left alone knowingly: `clamp_min(…, 1)` on the denominator still inflates the
+request rate below 1 req/s and understates the error rate there. §2 runs at
+20 req/s, well clear of the floor. Noted in the code rather than fixed, because
+the fix is a judgement about what an error rate means at near-zero traffic and
+that deserves its own change.
+
+### Removed
+
+- **`error_rate_percent` from `/slo`, and `get_error_rate()` with it.** The two
+  queries were complements over identical terms — `1 - x` and `x` — so the
+  field was always exactly `100 - availability_percent`, and producing it cost
+  a second Prometheus round trip on an endpoint the health monitor polls every
+  cycle and k6 hits under load. `/slo` now makes two queries per request
+  instead of three.
+
+  The redundancy was not merely wasteful. Rounded independently, the two fields
+  could land on 99.99 and 0.02 in the same response, which invites reading
+  agreement between them as corroboration — two fields that look like separate
+  measurements confirming each other, when one is arithmetic performed on the
+  other. Derive it at the point of use.
+
+  Nothing outside the app consumed it. Prometheus computes its own
+  `brp:error_rate:ratio5m` recording rule in `deploy/prometheus/rules/`, which
+  is what the alerts fire on and is untouched by this. The removal is a
+  response-shape change, so it belongs to `0.2.0` alongside the fixes above
+  rather than arriving unannounced later.
+
 ### Known gaps
 
 - **node2's app logs may not be reachable via `journalctl`.**

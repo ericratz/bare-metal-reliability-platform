@@ -144,7 +144,7 @@ Three design decisions that are easy to get wrong, and were:
 |---|---|---|
 | `GET /health` | **node-local** | No network calls. Node identity, version, process uptime, memory, disk. |
 | `GET /nginx-health` | LB-local | Served by nginx, never proxied. keepalived's failover probe. |
-| `GET /slo` | **fleet-wide** | Availability, error rate, p95 — from local Prometheus. Degrades to `status: unavailable`. |
+| `GET /slo` | **fleet-wide** | Availability and p95 — from local Prometheus. `null` + `no_data` for an empty window; `status: unavailable` if Prometheus is unreachable. Error rate is `100 - availability_percent`; it is not a separate field. |
 | `GET /metrics` | node-local | Prometheus exposition, `brp_` prefix. |
 | `GET /` | — | Landing page, names the serving node. |
 | `GET /docs` | — | Swagger UI. |
@@ -181,6 +181,15 @@ unreachable and when a query matched nothing, so an unreachable Prometheus
 rendered as **`availability_percent: 0.0`** — a healthy system reporting a total
 outage. Those cases are now distinct, and unreachable is reported as
 unreachable.
+
+That fix went one step short, and `0.2.0` finishes it. Splitting "unreachable"
+out left "matched nothing" answering with a per-metric default — `1.0` for
+availability — so `/slo` published **`availability_percent: 100.0`** for a fleet
+that had served almost nothing, indistinguishable from a measured 100%. The
+error had swapped direction, from pessimistic to flattering, which is the worse
+of the two: nobody investigates a green number. There are now three outcomes
+rather than two, and an empty window reports `null` with the affected metrics
+named in a `no_data` array.
 
 ---
 
@@ -234,17 +243,26 @@ configs in `deploy/`.
 ## Verifying the zero-downtime claim
 
 The claim is only worth anything with evidence attached, so the tooling produces
-some. All traffic goes at the **VIP**, not a node IP.
+some. All traffic goes at the **VIP**, not a node IP — and therefore **from
+node2**, since the VIP is only reachable from the lab LAN and node2 is the node
+that is neither the balancer nor the VRRP master.
 
 ```bash
+# on node2:
 # terminal A — every request, timestamped, with the node that served it
 ./scripts/watch-uptime.sh http://192.168.71.245/health
 
 # terminal B — 20 req/s, zero-failure threshold
-k6 run -e BASE_URL=http://192.168.71.245 -e DURATION=15m k6/rolling-update.js
+k6 run -e BASE_URL=http://192.168.71.245 -e MAX_VUS=50 -e DURATION=15m k6/rolling-update.js
 
 # terminal C — perform RUNBOOK.md
 ```
+
+Generating load from a node that is also serving it is a compromise, and worth
+naming rather than burying: there is no third machine on the LAN. It costs the
+per-node latency figure, which now includes k6's own consumption on node2. It
+does not cost the zero-dropped-requests result, which counts failed responses
+and is indifferent to which host asked.
 
 `watch-uptime.sh` exits non-zero if any request failed, so it cannot report
 success by default. Both it and the k6 scenario were tested against a
@@ -284,15 +302,26 @@ Verified locally: app port, container build, Prometheus config + rules
 injected-outage detection). Both nodes provisioned with static IPs and their
 container runtimes.
 
-**On real hardware, through `RUNBOOK.md` §1d:** firewalls configured per OS
-(§1a), linux-health-monitor v3.2 running as a timer on both nodes (§1·1), the
-app tier serving on both (§1b) — Docker Compose on node1, a rootless Podman
-Quadlet unit on node2, both answering `/health` as `0.1.0` — nginx serving on
-both (§1c), each balancing across both backends, with the monitor's HTML report
-at `/report`, and redundant Prometheus (§1d): 3.13.2 from the same upstream
-tarball on both nodes, each scraping both nodes, four targets up from each
-instance's point of view, with `/slo` answering. Both nodes' monitor runs
-exit 0.
+**`RUNBOOK.md` §1 is complete — the whole platform is running on real
+hardware.** Firewalls configured per OS (§1a); linux-health-monitor v3.2 on a
+timer on both nodes (§1·1); the app tier serving `0.1.0` on both (§1b), Docker
+Compose on node1 and a rootless Podman Quadlet unit on node2; nginx on both
+(§1c), each balancing across both backends, with the monitor's HTML report at
+`/report`; redundant Prometheus (§1d), 3.13.2 from the same upstream tarball on
+both nodes, each scraping both, four targets up from each instance, `/slo`
+answering; and keepalived floating the VIP (§1e).
+
+`192.168.71.245` is live on node1 with node2 as a healthy backup, verified as
+holder rather than assumed: from node2, ARP for the VIP resolves to
+`24:1c:04:14:42:ce` — node1's MAC — which is the same `answered_by` signal the
+health monitor now checks every cycle. A request to the VIP traverses the whole
+chain, and returned `node2`, confirming that node1's nginx balances into node2's
+backend.
+
+**Both nodes run the monitor and exit 0** with every component registered. That
+number is the deploy's actual output: the registration discipline means a clean
+exit says "this node is healthy as configured" rather than "nothing is being
+watched."
 
 **The 1:1 upstream split is now measured rather than assumed:** 40 sequential
 requests through node2's load balancer resolved 19/21 across the two nodes.
@@ -323,12 +352,18 @@ not. Details in `CHANGELOG.md`.
 
 Pending:
 
-- [ ] keepalived and the VIP on both nodes (§1e)
-- [ ] Rolling update and VIP failover executed and measured on real hardware
-- [ ] SLO numbers are not yet real — with almost no traffic, `/slo` reports
-      `availability_percent: 100.0` from an empty-result *default* rather than
-      a measurement, alongside a null error rate. k6 in §2 is what makes them
-      mean something
+- [ ] Rolling update (§2) and VIP failover drills (§3) executed and measured on
+      real hardware — the numbers this project exists to produce
+- [ ] SLO numbers are not yet real. `/slo` no longer *fabricates* them — an
+      empty window now reports `null` and says which metrics it has no data for,
+      instead of the `availability_percent: 100.0` it published throughout §1
+      — but null is an honest absence, not a measurement. k6 in §2 is what
+      makes them mean something
+- [ ] Per-node p95 from the §2 run will not be a clean number: there is no
+      third machine on the lab LAN, so k6 runs on node2, which is also one of
+      the two backends under test. The zero-dropped-requests claim is
+      unaffected — it counts failed responses, and does not care which host
+      asked
 - [ ] node2's app logs are not reachable via `journalctl --user`, so the
       monitor's journal check has nothing to read there; `podman logs` works
 - [ ] `httpd_can_network_connect` was set on node2 pre-emptively and is not

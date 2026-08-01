@@ -28,7 +28,13 @@ export const options = {
       timeUnit: '1s',
       duration: __ENV.DURATION || '10m',
       preAllocatedVUs: 20,
-      maxVUs: 200,
+      //Capped, because k6 runs on node2 — which is also one of the two backends
+      //under test. An open model holds the request rate steady by allocating
+      //more VUs when responses slow down, so an unbounded ceiling turns a
+      //latency blip into a load spike on a box that is already serving half the
+      //fleet's traffic, and the test then reports that spike as the platform's
+      //fault. See RUNBOOK.md §2 step 0 for why there is nowhere better to run it.
+      maxVUs: Number(__ENV.MAX_VUS || 200),
     },
   },
   thresholds: {
