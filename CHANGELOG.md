@@ -6,6 +6,53 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **`RUNBOOK.md` §1c assumed nginx was installed, that the distro ships no
+  conflicting server block, and that `systemctl enable --now` starts what you
+  configured.** All three were wrong, and in different ways per OS:
+
+  - nginx is on neither node. node1's image is minimized.
+  - Both packages ship a `listen 80 default_server` block, so `nginx -t` fails
+    with `duplicate default server` — but Debian puts it in
+    `sites-enabled/default` (unlink it) and RHEL puts it *inside*
+    `/etc/nginx/nginx.conf`, where there is no file to unlink. Same conflict,
+    no portable fix.
+  - Debian starts a service on package install, so nginx was already running
+    before the config existed and `--now` did nothing to an active unit. RHEL
+    does not auto-start, so node2 was never exposed. §1c now issues an explicit
+    `restart`, which is correct on both.
+
+  The `enable --now` case is the one worth keeping: `systemctl is-active` said
+  `active`, `nginx -t` said the config was valid, and `nginx -T` printed the
+  new config in full — while the stock default site served 404 on
+  `/nginx-health`. `nginx -T` reads from disk, not from the running master, so
+  it *cannot* detect this and reads as confirmation. `systemctl reload` did not
+  fix it either; only a full restart did. The only check that caught it was
+  `curl /nginx-health`, which is why that step is a verification and not a
+  formality. Recorded as observed — the package's install-time
+  `Upgrading binary nginx` (a USR2 binary upgrade) is the suspected cause, not
+  a confirmed one.
+- **node2 needed two SELinux changes to serve `/report` and proxy at all.**
+  `/var/www` is not RHEL's web root, so `/var/www/health` was created `var_t`
+  and nginx could not read the report — confirmed by `restorecon` relabelling
+  it to `httpd_sys_content_t`. `httpd_can_network_connect` is also set, since
+  SELinux otherwise blocks nginx from making outbound connections and every
+  `proxy_pass` to `:8000` fails; it was set pre-emptively, so unlike the
+  relabel it is not *proven* to have been required here. node1 needs neither —
+  AppArmor's nginx profile permits both.
+
+  The proxy case is the dangerous one and is why it is set anyway: with it
+  off, `/nginx-health` still returns 200 because nginx serves it locally, so
+  keepalived would see a perfectly healthy load balancer in front of a proxy
+  that cannot reach a single backend. §1e's health check is designed to answer
+  "is *this* node's nginx serving", and this is the one failure where that
+  correct design still points at a broken node.
+- `deploy/nginx/brp.conf` told you to create `/var/www/health` with
+  `install -d -m 755`, contradicting §1c's `2750` and the setgid reasoning two
+  files away. Following the comment would have published the report — which
+  enumerates listening ports, unit names, containers, addressing and MACs — to
+  every local account, and nothing would have looked wrong, since the page
+  renders identically either way. Corrected to the per-node setgid form.
+
 - **Podman silently dropped the container healthcheck.** `podman build` defaults
   to the OCI image format, which has no healthcheck field, so the Dockerfile's
   `HEALTHCHECK` was discarded with nothing but a build warning:

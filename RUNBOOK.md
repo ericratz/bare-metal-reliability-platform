@@ -404,13 +404,34 @@ place where the same config is correct on one node and silently non-functional
 on the other. If something is denied anyway, read the AVC rather than disabling
 SELinux — `sudo ausearch -m avc -ts recent`.
 
-**Enable and verify:**
+**Enable and verify.** The explicit `restart` is not redundant — see below:
 
 ```bash
-sudo nginx -t && sudo systemctl enable --now nginx
+sudo nginx -t && sudo systemctl enable --now nginx && sudo systemctl restart nginx
 curl -s http://127.0.0.1/nginx-health    # -> "nginx ok"  (nginx itself, never proxied)
 curl -s http://127.0.0.1/health | jq '{node, status}'   # proxied to a backend
 ```
+
+> **`enable --now` is not enough on node1, and neither is `reload`.** Debian
+> packages start a service on install, so nginx is already running before the
+> config is in place, and `--now` does nothing to an active unit. What you get
+> is `is-active: active`, `nginx -t` succeeding, `nginx -T` printing the new
+> config, and the stock default site still being served: 404 on
+> `/nginx-health`, HTML instead of JSON on `/health`. Every indicator reads
+> healthy while the config you installed is not the one answering.
+>
+> `systemctl reload nginx` did **not** fix it — observed, not explained; the
+> package's install-time `Upgrading binary nginx` step is the likely reason,
+> since a binary upgrade leaves workers parented differently than a plain
+> start. A full `restart` did. Note `nginx -T` cannot detect this at all: it
+> reads config from disk rather than from the running master, so it will
+> happily confirm a config that is not loaded.
+>
+> RHEL packages do not auto-start, so on node2 `enable --now` genuinely starts
+> nginx against the right config. The `restart` makes one sequence correct on
+> both without branching. This is also why the `/nginx-health` check below is a
+> real verification and not a formality — it is the only step in §1c that
+> distinguishes "nginx is running" from "nginx is running *your* config."
 
 Run the proxied `curl` a few times on each node — `node` should vary between
 node1 and node2, confirming the upstream reaches both.
@@ -451,16 +472,111 @@ of them to a single node. The reasoning is written out at the top of
 
 ### 1d. Prometheus (both nodes)
 
+**Installed from the upstream tarball on both nodes, not from a package.**
+Ubuntu has `prometheus` in universe (2.53.x); Rocky 10 has it in no enabled
+repo, and EPEL dropped it after EL8. Package-where-available would put a 2.x
+collector on node1 and a 3.x on node2 — and since the hardware is controlled
+for precisely so that per-node metric differences are attributable to the OS,
+two different collectors would give every such difference a second candidate
+explanation. Same version on both is the point. The reasoning is repeated in
+`deploy/prometheus/prometheus.service`, which is where someone will actually
+find it.
+
+**The trade is stated rather than hidden: this binary gets no distro security
+updates.** `unattended-upgrades` and `dnf update` will never touch it. Upgrading
+is re-running the download-and-install step below with a new version, on both
+nodes, and it is on you to notice a CVE. That is the cost of fleet consistency
+here; a single-OS fleet would not have to pay it.
+
+**Pick one version and use it on both nodes:**
+
 ```bash
-sudo cp deploy/prometheus/prometheus.yml /etc/prometheus/
-sudo cp -r deploy/prometheus/rules /etc/prometheus/
-# set external_labels.replica to this node's name in prometheus.yml
-sudo promtool check config /etc/prometheus/prometheus.yml
-sudo systemctl enable --now prometheus
+curl -s https://api.github.com/repos/prometheus/prometheus/releases/latest | jq -r .tag_name
 ```
 
+Prefer an LTS line if one is current — upgrades are manual, so a longer support
+window is worth more here than the newest features.
+
+**Install the binaries — run on BOTH nodes with the same `PROM_VER`:**
+
+```bash
+PROM_VER=<the version above, without the leading v>
+cd /tmp
+curl -sLO https://github.com/prometheus/prometheus/releases/download/v${PROM_VER}/prometheus-${PROM_VER}.linux-amd64.tar.gz
+curl -sLO https://github.com/prometheus/prometheus/releases/download/v${PROM_VER}/sha256sums.txt
+sha256sum -c --ignore-missing sha256sums.txt
+tar xzf prometheus-${PROM_VER}.linux-amd64.tar.gz
+sudo install -m 755 prometheus-${PROM_VER}.linux-amd64/prometheus prometheus-${PROM_VER}.linux-amd64/promtool /usr/local/bin/
+prometheus --version
+```
+
+The checksum step is not decoration — this is the one component in the platform
+installed by downloading a binary over the network instead of from a signed
+repository, so it is the one place where verifying what you got is on you.
+`--ignore-missing` is required because `sha256sums.txt` covers every platform.
+
+**User, directories and config — both nodes:**
+
+```bash
+id prometheus >/dev/null 2>&1 || sudo useradd --system --no-create-home --shell /usr/sbin/nologin prometheus
+sudo install -d -o root -g root -m 755 /etc/prometheus/rules
+sudo install -d -o prometheus -g prometheus -m 750 /var/lib/prometheus
+cd ~/bare-metal-reliability-platform
+sudo cp deploy/prometheus/prometheus.yml /etc/prometheus/
+sudo cp deploy/prometheus/rules/*.yml /etc/prometheus/rules/
+sudo install -m 644 deploy/prometheus/prometheus.service /etc/systemd/system/
+```
+
+**node2 only — the one line that differs, and one SELinux relabel:**
+
+```bash
+sudo sed -i 's|^    replica: node1$|    replica: node2|' /etc/prometheus/prometheus.yml
+grep -n 'replica:' /etc/prometheus/prometheus.yml      # must read node2
+sudo restorecon -v /usr/local/bin/prometheus /usr/local/bin/promtool
+```
+
+Do not skip the `grep`. Both instances silently claiming `replica: node1` is
+not an error anywhere — it produces two datasets that are indistinguishable the
+moment you compare them, which is the only reason the label exists.
+
+**Validate, then start — both nodes:**
+
+```bash
+sudo promtool check config /etc/prometheus/prometheus.yml
+sudo systemctl daemon-reload && sudo systemctl enable --now prometheus && sudo systemctl restart prometheus
+systemctl is-active prometheus
+```
+
+`promtool check config` follows `rule_files` and validates the rules too, so it
+covers `/etc/prometheus/rules/*.yml` without a separate `check rules` run. The
+explicit `restart` is for the same reason as §1c — `--now` is a no-op if the
+unit is somehow already active, and here it costs nothing.
+
+If node2 fails to start where node1 succeeded, read the denial before assuming
+the unit is wrong: `sudo journalctl -u prometheus -n 30 --no-pager` and
+`sudo ausearch -m avc -ts recent`. A binary under `/usr/local/bin` is the kind
+of path SELinux has opinions about.
+
 Confirm at `http://<node>:9090/targets` — both nodes should show 2 UP `brp-api`
-targets and 2 UP `prometheus` targets, from each node's point of view.
+targets and 2 UP `prometheus` targets, from each node's point of view. Or from
+a shell on either node:
+
+```bash
+curl -s 'http://127.0.0.1:9090/api/v1/targets?state=active' | jq -r '.data.activeTargets[] | "\(.labels.job) \(.labels.node) \(.health)"'
+```
+
+Four lines, all `up`. Then confirm the two instances disagree about who they
+are, which is what proves the `replica` edit landed on the running config
+rather than only on disk:
+
+```bash
+curl -s http://127.0.0.1:9090/api/v1/status/config | jq -r .data.yaml | grep -A3 external_labels
+```
+
+`node1` on node1, `node2` on node2. Note this is the *only* way to see it from
+Prometheus: `external_labels` are attached to federation, remote-write and
+alerts — never to local query results — so `query=up` will not show them and is
+not a check.
 
 **Register.** Add `prometheus.service` to `HEALTH_SERVICES`, and this node's
 `http://127.0.0.1:8000/slo` (the `fleet-slo` entry) to `HEALTH_APP_ENDPOINTS`

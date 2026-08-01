@@ -274,33 +274,49 @@ Verified locally: app port, container build, Prometheus config + rules
 injected-outage detection). Both nodes provisioned with static IPs and their
 container runtimes.
 
-**On real hardware, through `RUNBOOK.md` §1b:** firewalls configured per OS
-(§1a), linux-health-monitor v3.2 running as a timer on both nodes (§1·1), and
-the app tier serving on both — Docker Compose on node1, a rootless Podman
-Quadlet unit on node2, both answering `/health` as `0.1.0` on their own
-addresses and each other's. Both nodes' monitor runs exit 0.
+**On real hardware, through `RUNBOOK.md` §1c:** firewalls configured per OS
+(§1a), linux-health-monitor v3.2 running as a timer on both nodes (§1·1), the
+app tier serving on both (§1b) — Docker Compose on node1, a rootless Podman
+Quadlet unit on node2, both answering `/health` as `0.1.0` — and nginx serving
+on both (§1c), each balancing across both backends, with the monitor's HTML
+report served at `/report`. Both nodes' monitor runs exit 0.
+
+**The 1:1 upstream split is now measured rather than assumed:** 40 sequential
+requests through node2's load balancer resolved 19/21 across the two nodes.
+Short samples do *not* alternate cleanly — nginx keeps round-robin state per
+worker process, and there are four workers per node — which is why the split is
+read from volume, not from a handful of requests.
 
 That exit code is the point of the registration discipline: `HEALTH_SERVICES`
 and `HEALTH_APP_ENDPOINTS` start trimmed to what exists and grow as each
 component lands, so the monitor is meaningful during the deploy rather than
 sitting at a standing WARNING until the platform is finished.
 
-§1b also produced the project's sharpest portability findings so far, all three
-on node2 and all three silent — Podman discarding the Dockerfile `HEALTHCHECK`
-under the OCI image format, pasta's wildcard bind resetting IPv6 connections
-that Docker's userland proxy quietly bridges, and the Quadlet's
-`EnvironmentFile` shadowing the version baked in by the build-arg. Same
-Dockerfile, same build-arg, two different artifacts, and nothing at runtime
-said so. Details in `CHANGELOG.md`.
+§1b and §1c produced the project's sharpest portability findings so far, and
+every one of them was silent. Podman discarded the Dockerfile `HEALTHCHECK`
+under the OCI image format; pasta's wildcard bind reset IPv6 connections that
+Docker's userland proxy quietly bridges; the Quadlet's `EnvironmentFile`
+shadowed the version baked in by the build-arg. Then nginx: the two distros
+ship their conflicting default server block in places that admit no common fix,
+Debian's package start left `systemctl is-active`, `nginx -t` *and* `nginx -T`
+all reporting success while the wrong config served traffic, and node2 needed
+SELinux work node1 has no equivalent of.
+
+The recurring shape is worth stating plainly, because it is the answer to the
+question this project was built to ask: the divergences are not where the two
+OSes are *spelled* differently — those are easy and the runbook always had them
+— they are where one OS silently does something for you that the other does
+not. Details in `CHANGELOG.md`.
 
 Pending:
 
-- [ ] nginx, Prometheus and keepalived on both nodes (§1c–§1e)
+- [ ] Prometheus and keepalived on both nodes (§1d–§1e)
 - [ ] Rolling update and VIP failover executed and measured on real hardware
-- [ ] `nginx -t` against the current `brp.conf` — the `/report` block postdates
-      the last validation; §1c gates `systemctl enable --now` on it
 - [ ] node2's app logs are not reachable via `journalctl --user`, so the
       monitor's journal check has nothing to read there; `podman logs` works
+- [ ] `httpd_can_network_connect` was set on node2 pre-emptively and is not
+      proven to have been required — unlike the `/var/www/health` relabel,
+      which `restorecon` confirmed
 
 Deferred: Alertmanager routing (rules evaluate and display in Prometheus's UI,
 they just do not notify anywhere yet).

@@ -1,0 +1,70 @@
+#/etc/systemd/system/prometheus.service   (IDENTICAL on both nodes)
+#
+#Prometheus is installed from the upstream tarball rather than a distro
+#package, and this unit is why that is not just extra work.
+#
+#Ubuntu carries `prometheus` in universe (2.53.x); Rocky 10 carries it in no
+#enabled repo at all — not baseos, not appstream, not extras — and EPEL dropped
+#it after EL8. Taking the package where it exists and a tarball where it does
+#not would put a 2.x collector on one node and a 3.x collector on the other,
+#with different unit files, service users and data paths.
+#
+#That is disqualifying for this project specifically. The hardware is
+#controlled for so that any per-node difference in the metrics is attributable
+#to the OS. Two different Prometheus versions would hand every such difference
+#a second candidate explanation and quietly destroy the one measurement the
+#whole two-node setup exists to make. So: same tarball, same version, same
+#unit, both nodes. The cost is that upgrades are manual and unattended-upgrades
+#will never patch it — see RUNBOOK.md §1d.
+#
+#The ONLY per-node difference in the whole Prometheus deployment is
+#`external_labels.replica` in prometheus.yml.
+
+[Unit]
+Description=Prometheus
+Documentation=https://prometheus.io/docs/introduction/overview/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=prometheus
+Group=prometheus
+
+#--storage.tsdb.path is NOT the upstream default (./data, relative to the
+#working directory). Left unset it would write into whatever directory systemd
+#started the process in.
+#
+#Retention: 30d. Both nodes have a 2TB disk that is nearly empty, so the space
+#is free — but it is a 5400rpm HDD, so the constraint is IOPS, not capacity.
+#Two scrape jobs at 30s is a trivial write rate; raise retention before raising
+#scrape frequency if this ever needs to grow.
+#
+#--web.enable-lifecycle allows `POST /-/reload` so a config change does not
+#need a restart (which would drop the in-memory head block to disk early).
+#:9090 is firewalled to the two nodes by RUNBOOK.md §1a, so this is not exposed
+#to the LAN.
+ExecStart=/usr/local/bin/prometheus \
+  --config.file=/etc/prometheus/prometheus.yml \
+  --storage.tsdb.path=/var/lib/prometheus \
+  --storage.tsdb.retention.time=30d \
+  --web.listen-address=0.0.0.0:9090 \
+  --web.enable-lifecycle
+
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+
+#TSDB shutdown flushes the head block. Killing it early is what produces the
+#"WAL replay" delay on the next start, so give it room.
+TimeoutStopSec=120
+
+#Prometheus needs no privileges: it reads config and writes one directory.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/prometheus
+
+[Install]
+WantedBy=multi-user.target
