@@ -323,15 +323,93 @@ rather than an oversight:
 
 ### 1c. nginx (both nodes)
 
+**Validate the config before installing it.** §1c is gated on this because
+`brp.conf` changes between deploys and a bad one takes ingress down on the node
+you are standing on. The workstation is NAT'd off the lab LAN and has no docker
+daemon, so run it on node1:
+
+```bash
+cd ~/bare-metal-reliability-platform
+docker run --rm -v "$PWD/deploy/nginx:/etc/nginx/conf.d:ro" nginx:alpine nginx -t
+```
+
+Mount the whole directory, not the two files — it replaces the image's own
+`default.conf`, which otherwise collides with `listen 80 default_server` and
+makes the test fail for a reason that does not exist on the nodes.
+
+**Install nginx.** Not present on either node; node1's image is minimized, so
+assume nothing:
+
+```bash
+command -v nginx || sudo apt-get install -y nginx    # node1
+command -v nginx || sudo dnf install -y nginx        # node2
+```
+
+**Remove the distro's default server, or `nginx -t` fails on both nodes** —
+`duplicate default server for 0.0.0.0:80`. Both packages ship a server block
+listening on `:80 default_server`, and they ship it in different places, so the
+fix is not portable:
+
+```bash
+# node1 (Ubuntu) — a separate file, and nginx.conf includes sites-enabled/*
+sudo rm -f /etc/nginx/sites-enabled/default
+
+# node2 (Rocky) — the block lives INSIDE /etc/nginx/nginx.conf, no file to unlink
+sudo cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.bak
+sudo sed -i '/^    server {/,/^    }/d' /etc/nginx/nginx.conf
+```
+
+Check node2's result before trusting it — that `sed` deletes the first
+indented `server` block, and a package update could change the indentation
+under it:
+
+```bash
+grep -n 'server {\|listen' /etc/nginx/nginx.conf   # expect no server block left
+```
+
+`nginx.conf.bak` is safe to leave in place: nginx includes `conf.d/*.conf`, not
+`/etc/nginx/*`, so it is inert. Restore from it if the grep looks wrong.
+
+**Install the configs and the report directory:**
+
 ```bash
 # Debian: /etc/nginx/conf.d/ ; RHEL: same path, both use conf.d
 sudo cp deploy/nginx/brp-upstream.conf deploy/nginx/brp.conf /etc/nginx/conf.d/
 # target of location = /report — setgid is required, see below the block
 sudo install -d -o root -g www-data -m 2750 /var/www/health   # node1 (Ubuntu)
 sudo install -d -o root -g nginx    -m 2750 /var/www/health   # node2 (Rocky)
+```
+
+**SELinux — node2 only, and this is the step that decides whether the proxy
+works at all.** Two separate denials, neither of which produces a useful error:
+
+```bash
+# 1. nginx may not make outbound connections by default under SELinux, so
+#    every proxy_pass to :8000 fails and the node serves 502s while
+#    /nginx-health still answers 200 — i.e. keepalived sees a healthy LB
+#    in front of a proxy that cannot reach anything.
+sudo setsebool -P httpd_can_network_connect 1
+
+# 2. /var/www is not RHEL's web root (/usr/share/nginx/html is), so files
+#    created there do not carry httpd_sys_content_t and nginx is denied
+#    reading the report — a 403, indistinguishable at a glance from the
+#    wrong-group 403 described below.
+command -v semanage || sudo dnf install -y policycoreutils-python-utils
+sudo semanage fcontext -a -t httpd_sys_content_t "/var/www/health(/.*)?"
+sudo restorecon -Rv /var/www/health
+```
+
+node1 needs neither: AppArmor's nginx profile permits both, so this is another
+place where the same config is correct on one node and silently non-functional
+on the other. If something is denied anyway, read the AVC rather than disabling
+SELinux — `sudo ausearch -m avc -ts recent`.
+
+**Enable and verify:**
+
+```bash
 sudo nginx -t && sudo systemctl enable --now nginx
-curl -s localhost/nginx-health          # -> "nginx ok"  (nginx itself, never proxied)
-curl -s localhost/health | jq '{node, status}'   # proxied to a backend
+curl -s http://127.0.0.1/nginx-health    # -> "nginx ok"  (nginx itself, never proxied)
+curl -s http://127.0.0.1/health | jq '{node, status}'   # proxied to a backend
 ```
 
 Run the proxied `curl` a few times on each node — `node` should vary between

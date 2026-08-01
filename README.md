@@ -274,21 +274,33 @@ Verified locally: app port, container build, Prometheus config + rules
 injected-outage detection). Both nodes provisioned with static IPs and their
 container runtimes.
 
-**linux-health-monitor v3.2 is deployed and running as a timer on both nodes**
-— currently the only part of this platform that exists on real hardware. Both
-nodes report WARNING, which is correct: they are running none of the services
-they are configured to watch. `RUNBOOK.md` §1 trims that configuration to what
-actually exists and grows it as each component lands, so the exit code is worth
-reading during the deploy rather than only after it.
+**On real hardware, through `RUNBOOK.md` §1b:** firewalls configured per OS
+(§1a), linux-health-monitor v3.2 running as a timer on both nodes (§1·1), and
+the app tier serving on both — Docker Compose on node1, a rootless Podman
+Quadlet unit on node2, both answering `/health` as `0.1.0` on their own
+addresses and each other's. Both nodes' monitor runs exit 0.
+
+That exit code is the point of the registration discipline: `HEALTH_SERVICES`
+and `HEALTH_APP_ENDPOINTS` start trimmed to what exists and grow as each
+component lands, so the monitor is meaningful during the deploy rather than
+sitting at a standing WARNING until the platform is finished.
+
+§1b also produced the project's sharpest portability findings so far, all three
+on node2 and all three silent — Podman discarding the Dockerfile `HEALTHCHECK`
+under the OCI image format, pasta's wildcard bind resetting IPv6 connections
+that Docker's userland proxy quietly bridges, and the Quadlet's
+`EnvironmentFile` shadowing the version baked in by the build-arg. Same
+Dockerfile, same build-arg, two different artifacts, and nothing at runtime
+said so. Details in `CHANGELOG.md`.
 
 Pending:
 
-- [ ] Deploy the stack to both nodes (app, nginx, Prometheus, keepalived)
-- [ ] node2 Podman Quadlet unit
-- [ ] Firewall + SELinux per node — node2 still needs `8000/tcp` and VRRP
+- [ ] nginx, Prometheus and keepalived on both nodes (§1c–§1e)
 - [ ] Rolling update and VIP failover executed and measured on real hardware
 - [ ] `nginx -t` against the current `brp.conf` — the `/report` block postdates
       the last validation; §1c gates `systemctl enable --now` on it
+- [ ] node2's app logs are not reachable via `journalctl --user`, so the
+      monitor's journal check has nothing to read there; `podman logs` works
 
 Deferred: Alertmanager routing (rules evaluate and display in Prometheus's UI,
 they just do not notify anywhere yet).
