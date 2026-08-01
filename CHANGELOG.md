@@ -30,12 +30,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   empty body and exits, which reads as a dead app while it is serving 200s on
   the v4 literal and on its LAN address.
 
-  `PublishPort` in `deploy/podman/brp-api.container` is now
-  `0.0.0.0:8000:8000`, so `::1` refuses cleanly and clients fall back; the
-  verification commands address `127.0.0.1` explicitly rather than relying on
-  that fallback. Nothing in the platform needed v6 ingress — the nginx
-  upstream, the Prometheus targets, `PROM_URL` and the health monitor's
-  endpoints are all v4 literals, which is why this stayed invisible.
+  Fixed by passing `--ipv4-only` through to pasta
+  (`Network=pasta:--ipv4-only` in `deploy/podman/brp-api.container`), so `::1`
+  refuses cleanly and clients fall back; the verification commands address
+  `127.0.0.1` explicitly rather than relying on that fallback. Nothing in the
+  platform needed v6 ingress — the nginx upstream, the Prometheus targets,
+  `PROM_URL` and the health monitor's endpoints are all v4 literals, which is
+  why this stayed invisible.
+
+  **`PublishPort=0.0.0.0:8000:8000` does not work and was the first attempt.**
+  The bind address lands in the unit and is then discarded: podman hands pasta
+  a bare `-t 8000-8000:8000-8000`, the wildcard bind survives, and `::1` keeps
+  resetting. Nothing reports the setting as ignored — `podman ps` prints
+  `0.0.0.0:8000->8000/tcp` in both cases, so the only ground truth is the pasta
+  command line in `pgrep -a pasta` and whether `ss` shows `0.0.0.0:8000` or
+  `*:8000`. A config knob that is accepted, displayed as applied, and silently
+  inert is worth recording as its own finding.
 
   Same shape as the healthcheck finding: node1 runs the identical image over
   `localhost` without complaint, because Docker's userland proxy publishes on

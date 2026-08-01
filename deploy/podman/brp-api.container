@@ -28,21 +28,42 @@ Wants=network-online.target
 Image=localhost/brp-api:latest
 ContainerName=brp-api
 
-# IPv4 explicitly, NOT a bare `8000:8000`. Rootless Podman forwards with pasta,
-# which binds the wildcard and so accepts on ::1 as well — but the container's
-# uvicorn listens on 0.0.0.0 only, so a v6 connection completes its handshake
-# and is then reset with nothing behind it. `localhost` resolves ::1 first on
-# Rocky, and because the TCP connect SUCCEEDS the client does not fall back to
-# 127.0.0.1: curl reports "Recv failure: Connection reset by peer", or with -s
-# just an empty body. Binding v4 only turns that into a clean refusal on ::1,
-# which clients do fall back from.
+# Rootless Podman forwards with pasta, which binds the WILDCARD and so accepts
+# on ::1 as well — but the container's uvicorn listens on 0.0.0.0 only, so a v6
+# connection completes its handshake and is then reset with nothing behind it.
+# `localhost` resolves ::1 first on Rocky, and because the TCP connect SUCCEEDS
+# the client does not fall back to 127.0.0.1: curl reports "Recv failure:
+# Connection reset by peer", or with -s just an empty body — which reads as a
+# dead app while it serves 200s on the v4 literal and on the LAN address.
 #
 # node1 does not have this problem with the same image: Docker's userland proxy
 # publishes on both families and bridges v6 to the container's v4 socket. Same
-# artifact, different behaviour — see CHANGELOG. Nothing in the platform needs
-# v6 ingress here (nginx upstream, Prometheus targets and the health monitor's
-# endpoints are all v4 literals), so pinning the family costs nothing.
-PublishPort=0.0.0.0:8000:8000
+# artifact, different behaviour — see CHANGELOG.
+#
+# The bind address is deliberately NOT set here. `PublishPort=0.0.0.0:8000:8000`
+# was tried and is INERT under pasta: it lands in the unit, and podman then
+# hands pasta a bare `-t 8000-8000:8000-8000` with the address dropped, so the
+# wildcard bind and the reset both survive. Verified on node2 by reading the
+# pasta command line out of `pgrep -a pasta` — the setting cannot be confirmed
+# from this file or from `podman ps`, both of which report 0.0.0.0 either way.
+PublishPort=8000:8000
+
+# This is what actually pins the family: --ipv4-only is passed straight through
+# to pasta, so nothing listens on ::1 and a v6 client gets a clean REFUSAL,
+# which it does fall back from. Nothing in the platform needs v6 ingress — the
+# nginx upstream, the Prometheus targets, PROM_URL and the health monitor's
+# endpoints are all v4 literals — so this costs nothing.
+#
+# Confirm it took effect on the pasta process, never on this file:
+#     pgrep -a pasta                    # expect --ipv4-only in the args
+#     ss -ltn | grep 8000               # expect 0.0.0.0:8000, not *:8000
+#
+# The alternative fix is to make uvicorn dual-stack (`--host ::` in the
+# Dockerfile CMD), which addresses the cause rather than the exposure. Rejected
+# for now: it changes the shared artifact to fix a node2-only forwarding quirk,
+# so it would need node1 rebuilt and re-verified, and it makes the container's
+# v4 reachability depend on net.ipv6.bindv6only staying 0.
+Network=pasta:--ipv4-only
 
 # The one file that differs between nodes. Same NODE_NAME/APP_VERSION/PROM_URL
 # contract as node1's compose, from the same .env, so both nodes are configured

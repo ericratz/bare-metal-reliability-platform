@@ -30,9 +30,11 @@ systemctl --user daemon-reload
 systemctl --user start brp-api
 systemctl --user status brp-api --no-pager
 
-# 5. verify — 127.0.0.1, never `localhost`, see the PublishPort note in the unit
+# 5. verify — 127.0.0.1, never `localhost`, see the pasta note in the unit
 curl -s http://127.0.0.1:8000/health | jq '{node, version, status}'
 podman ps --format '{{.Names}}\t{{.Status}}'   # Status must show (healthy)
+pgrep -a pasta | grep -- --ipv4-only          # the v6-reset fix, on the process
+ss -ltn | grep 8000                            # 0.0.0.0:8000, never *:8000
 ```
 
 ## Updating (rolling-update step 4 on node2)

@@ -275,8 +275,20 @@ podman ps --format '{{.Names}}\t{{.Status}}'   # Status must show (healthy)
 > so a v6 connection completes its handshake and is then reset. `localhost`
 > resolves `::1` first on Rocky, and because the connect succeeded the client
 > does not fall back to v4 — `curl -s` prints an empty body and exits, which
-> reads as "the app is down" when it is serving fine. `PublishPort` in the
-> Quadlet now pins v4 so `::1` refuses cleanly, but address the literal anyway.
+> reads as "the app is down" when it is serving fine.
+>
+> The Quadlet passes `--ipv4-only` to pasta so `::1` refuses cleanly and clients
+> fall back, but address the literal anyway rather than depending on that.
+> Setting a bind address on `PublishPort` does **not** work — podman drops it
+> when building pasta's forwarding spec. Confirm the flag on the process, since
+> neither the unit file nor `podman ps` will tell you:
+>
+> ```bash
+> pgrep -a pasta | grep -- --ipv4-only && ss -ltn | grep 8000
+> ```
+>
+> `ss` must show `0.0.0.0:8000`. A `*:8000` there means the wildcard bind is
+> back and the reset with it.
 
 > **SELinux (node2).** If the container cannot bind its port or is denied at
 > startup, check `sudo ausearch -m avc -ts recent`. Do not blanket-disable
