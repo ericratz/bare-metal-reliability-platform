@@ -886,6 +886,23 @@ with `pool.sh` rather than trusted to be noticed.
 - [ ] Both in the pool: `sudo ./scripts/pool.sh status` → both `[IN ]`
 - [ ] New image built on both nodes (or built once and `podman/docker save | ssh … load`)
 - [ ] Nothing else deploying
+- [ ] **Both checkouts are at the commit you intend to deploy**, and the same one:
+
+      ```bash
+      for n in 251 252; do echo -n "node .$n: "; ssh ericratz@192.168.71.$n 'git -C ~/bare-metal-reliability-platform pull --quiet && git -C ~/bare-metal-reliability-platform rev-parse --short HEAD'; done
+      ```
+
+      Both must print the same hash. This is a gate, not housekeeping: `APP_VERSION`
+      comes from `.env` and is set independently of what is in the checkout, so
+      building a stale tree produces an image **tagged and reporting `0.2.0` while
+      containing the old code**. Step 5 below gates on the version string and would
+      pass it. Nothing downstream catches it either — the version is right, the
+      container restarted, `uptime_seconds` is small. You would have a green
+      rollout of nothing, and then debug the missing fix on the node that
+      "deployed" it.
+
+      A pull is not an install. Neither node's running container changes until it
+      is rebuilt, which is step 4 and step 7.
 - [ ] k6 installed on node2 — see below, it is not in Rocky's base repos
 - [ ] You know what the new version *is*. 0.2.0 is the `/slo` no-data fix; see
       `CHANGELOG.md`. Step 5 gates on `version` changing, so a rebuild with no
@@ -994,6 +1011,7 @@ the mistake this whole procedure exists to prevent.
 ```bash
 ssh ericratz@192.168.71.252
 cd ~/bare-metal-reliability-platform
+git pull                       # the image is built from this tree; see preconditions
 # .env FIRST: the Quadlet's EnvironmentFile injects APP_VERSION at runtime and
 # that shadows what the build-arg baked in, so a rebuild alone leaves /health
 # reporting the old version and step 5 below gates on a value nothing changed.
@@ -1030,6 +1048,7 @@ Compose rather than a Quadlet:
 ```bash
 ssh ericratz@192.168.71.251      # a new session; leave node2's terminals A and B alone
 cd ~/bare-metal-reliability-platform
+git pull                       # the image is built from this tree; see preconditions
 sed -i 's/^APP_VERSION=.*/APP_VERSION=0.2.0/' .env
 # docker-compose.yml reads ${APP_VERSION} for BOTH the build-arg and the runtime
 # environment, so the one edit above covers what node2 needed two mechanisms for.

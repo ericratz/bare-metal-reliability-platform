@@ -323,11 +323,21 @@ number is the deploy's actual output: the registration discipline means a clean
 exit says "this node is healthy as configured" rather than "nothing is being
 watched."
 
-**The 1:1 upstream split is now measured rather than assumed:** 40 sequential
-requests through node2's load balancer resolved 19/21 across the two nodes.
-Short samples do *not* alternate cleanly — nginx keeps round-robin state per
-worker process, and there are four workers per node — which is why the split is
-read from volume, not from a handful of requests.
+**The 1:1 upstream split is measured, not assumed.** Under k6 through the VIP:
+**300/301** over 601 requests, and **182/186** on a second run — 49.5/50.5.
+(An earlier 40-request curl sample gave 19/21, which is the same answer with
+far less confidence.) Short samples do *not* alternate cleanly — nginx keeps
+round-robin state per worker process, and there are four workers per node —
+which is why the split is read from volume, not from a handful of requests.
+
+**Per-node p95, however, is not comparable between these nodes.** Loading each
+backend directly gives 30.8ms on node1 against 5.1ms on node2, while the two
+apps answer in 1.9ms and 1.85ms *measured on their own hosts*. Identical image,
+identical code, equally fast in place — the difference appears only in requests
+arriving from another machine, and it is variance rather than a constant offset,
+which is why p95 shows it and means do not. The unexamined path is node1's
+ingress chain (ufw → conntrack → DNAT → Docker bridge), which node2's pasta
+forwarding has no equivalent of. See `CHANGELOG.md`.
 
 That exit code is the point of the registration discipline: `HEALTH_SERVICES`
 and `HEALTH_APP_ENDPOINTS` start trimmed to what exists and grow as each
@@ -359,11 +369,15 @@ Pending:
       instead of the `availability_percent: 100.0` it published throughout §1
       — but null is an honest absence, not a measurement. k6 in §2 is what
       makes them mean something
-- [ ] Per-node p95 from the §2 run will not be a clean number: there is no
-      third machine on the lab LAN, so k6 runs on node2, which is also one of
-      the two backends under test. The zero-dropped-requests claim is
-      unaffected — it counts failed responses, and does not care which host
-      asked
+- [ ] Per-node p95 from the §2 run will not be a clean number, for two separate
+      reasons: k6 runs on node2, which is also one of the two backends under
+      test, and node1 is independently slower to answer off-box requests (see
+      above). The zero-dropped-requests claim is unaffected — it counts failed
+      responses, and does not care which host asked
+- [ ] node1's ingress-path latency is diagnosed only by elimination. The app,
+      the image, Docker's port publishing and the link are all ruled out by
+      measurement; ufw/conntrack/DNAT/bridge is the remaining candidate and has
+      not been instrumented
 - [ ] node2's app logs are not reachable via `journalctl --user`, so the
       monitor's journal check has nothing to read there; `podman logs` works
 - [ ] `httpd_can_network_connect` was set on node2 pre-emptively and is not

@@ -322,6 +322,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   out. And the k6 summary writes to `evidence/`, which k6 will not create, so
   step 0 makes the directory first.
 
+- **§2 never said to `git pull` before building, and the omission was invisible
+  by construction.** `APP_VERSION` comes from `.env` and is set independently of
+  the checkout, so building a stale tree yields an image tagged `0.2.0`, whose
+  `/health` reports `version: 0.2.0`, containing the previous code. Step 5 gates
+  on exactly that version string and would have passed it — as would every other
+  signal, since the container really did restart and `uptime_seconds` really is
+  small. The result is a green rollout of nothing, followed by debugging a
+  missing fix on the node that just reported deploying it.
+
+  Now a precondition that pulls both nodes and compares `rev-parse --short HEAD`
+  between them, plus an explicit `git pull` in steps 4 and 7. Stated there
+  because it is the kind of step that reads as obvious and gets skipped: node2
+  had been pulled repeatedly during the k6 work while node1 sat several commits
+  behind, and nothing in the procedure would have said so.
+
 ### Fixed
 
 *This is what `0.2.0` carries.* §2 proves a rolling update by showing `version`
@@ -449,6 +464,58 @@ that deserves its own change.
   rather than arriving unannounced later.
 
 ### Known gaps
+
+- **node1 answers external requests measurably slower than node2, and only
+  from off-box.** Found while installing k6, before §2 ran — the first time
+  either node had been load-tested on hardware. Measured, in order, because
+  each result invalidated the previous explanation:
+
+  | measurement | node1 | node2 |
+  |---|---|---|
+  | app from its own host | 1.9ms (published) / 1.7ms (container IP) | 1.85ms |
+  | single request from the *other* node | 2.87 / 5.65 / 8.06ms | 2.42 / 2.45 / 3.85ms |
+  | p95 under 10 VUs, direct to backend | **30.8ms** | **5.1ms** |
+  | p95 under 10 VUs, via the VIP | 13.0ms | 5.4ms |
+
+  **The two apps are equally fast.** Measured on their own hosts they are
+  within 0.05ms of each other, so this is not the image, the interpreter, or
+  the code — all of which are identical artifacts. Docker's port publishing is
+  not the cost either: via the published port and straight to the container IP
+  differ by 0.3ms on node1.
+
+  **The link is not the cause.** 60 ICMP packets node2 → node1 produced nothing
+  over 10ms, and the reverse direction is clean too, so the paired
+  node1→node2 / node2→node1 comparison above crosses a link known good in both
+  directions. Best case matches on both nodes; node1's *variance* is what
+  differs, which is why it surfaces at p95 and stays invisible in means.
+
+  What is left unmeasured is the one path these tests skip: traffic entering
+  node1 from another host through its NIC, ufw, conntrack, iptables DNAT and
+  the Docker bridge. Loopback and container-IP requests bypass that chain
+  entirely, which is exactly why node1 looks healthy when probed from itself.
+  node2 has no equivalent — pasta forwards in userspace and firewalld never
+  sees container traffic. Unproven, and the most likely candidate.
+
+  Consequences for §2: **per-node p95 is not comparable between these nodes**,
+  for reasons that predate any rollout. The zero-dropped-requests claim is
+  unaffected — a slow response is still a successful one. Do not read a p95
+  difference in the §2 evidence as something the rollout caused.
+
+- **The workstation cannot be used as the load generator, despite reaching the
+  lab LAN.** It was excluded originally on the belief that WSL2 was NAT'd off
+  the LAN entirely; that was wrong — `ssh` and `curl` to the VIP both work. But
+  measuring the path found episodic stalls specific to it: pinging node1 from
+  the workstation produced `seq 21/22/23` at 214ms, 136ms and 60ms —
+  consecutive and decaying, one ~400ms freeze with a queue draining behind it,
+  not distributed jitter. The same workstation pings node2 cleanly, and node2
+  pings node1 cleanly, so the fault is in the workstation↔node1 pair, where
+  WSL2's NAT and the Windows host's neighbour table sit outside Linux's view.
+  Notably the VIP (`.245`, node1's same NIC) stays clean, which fits: keepalived
+  gratuitously ARPs it continuously, so that entry never goes stale.
+
+  So k6 stays on node2 and the contamination caveat in §2 stands. Recorded
+  because "the workstation is off the LAN" was load-bearing and false, and the
+  replacement reason is different and needs to be the one on record.
 
 - **node2's app logs may not be reachable via `journalctl`.**
   `journalctl --user -u brp-api` returns "No journal files were found" on node2
