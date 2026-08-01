@@ -6,6 +6,55 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Podman silently dropped the container healthcheck.** `podman build` defaults
+  to the OCI image format, which has no healthcheck field, so the Dockerfile's
+  `HEALTHCHECK` was discarded with nothing but a build warning:
+  `HEALTHCHECK is not supported for OCI image format and will be ignored`.
+  node1's Docker build kept it and reported `Up (healthy)`; node2's container
+  had no health gating whatsoever. One Dockerfile, one build-arg, two
+  materially different artifacts. Now built with `--format docker` in
+  `RUNBOOK.md` §1b, §2 step 4, and `deploy/podman/README.md`.
+
+  The third instance of the OS-is-the-variable thesis after the two firewall
+  findings, and the first where the divergence is in the *artifact* rather than
+  the host plumbing — which is the case the project's central question was
+  actually asking about. It is also the quietest: nothing at runtime reports
+  that a container has no healthcheck, so the gap is visible only in build
+  output nobody re-reads.
+- **`localhost` does not reach the app on node2.** Rootless Podman forwards
+  with pasta, which binds the wildcard and accepts on `::1`, while the
+  container's uvicorn listens on `0.0.0.0` only — so a v6 connection completes
+  its TCP handshake and is then reset with nothing behind it. Rocky resolves
+  `localhost` to `::1` first, and because the *connect* succeeded the client
+  does not fall back to `127.0.0.1`; `curl -s localhost:8000/health` returns an
+  empty body and exits, which reads as a dead app while it is serving 200s on
+  the v4 literal and on its LAN address.
+
+  `PublishPort` in `deploy/podman/brp-api.container` is now
+  `0.0.0.0:8000:8000`, so `::1` refuses cleanly and clients fall back; the
+  verification commands address `127.0.0.1` explicitly rather than relying on
+  that fallback. Nothing in the platform needed v6 ingress — the nginx
+  upstream, the Prometheus targets, `PROM_URL` and the health monitor's
+  endpoints are all v4 literals, which is why this stayed invisible.
+
+  Same shape as the healthcheck finding: node1 runs the identical image over
+  `localhost` without complaint, because Docker's userland proxy publishes on
+  both families and bridges v6 to the container's v4 socket. Docker hides the
+  mismatch; Podman surfaces it. A connect-then-reset is the worse failure of
+  the two — a clean refusal is retried, a reset is not.
+- **`APP_VERSION` must be set in `.env` on node2, not only as a build-arg.**
+  The app reads the version from its runtime environment
+  (`app/core/settings.py`), and the Quadlet's `EnvironmentFile` injects `.env`
+  into the container — which overrides the `ENV APP_VERSION` the build-arg
+  baked in. With the shipped `.env.example` default, a build tagged `0.1.0`
+  reported `"dev"`.
+
+  node1 has no such split: compose feeds one `.env` value to the build-arg, the
+  image tag and the runtime env at once. The consequence was in §2 step 4,
+  which rebuilt with a new build-arg and then gated the return-to-pool on step
+  5 seeing a new `version` — a check that could never have fired, on the one
+  signal that proves a rolling update landed. Both steps now bump `.env` first.
+
 - **VIP moved from `192.168.71.250` to `192.168.71.245`.** `.250` was already
   held by an appliance at `d8:44:89:a0:66:60` — it answers ARP and 404s
   `/health`, which is why early monitor runs reported the VIP unreachable. The
@@ -96,6 +145,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   since a rename in either repo would otherwise flip precedence unannounced.
 
 ### Known gaps
+
+- **node2's app logs may not be reachable via `journalctl`.**
+  `journalctl --user -u brp-api` returns "No journal files were found" on node2
+  even though the unit is running and its systemd messages are visible through
+  `systemctl --user status`. `LogDriver=journald` was chosen in the Quadlet
+  specifically so the health monitor's `journalctl -t brp-api` check could read
+  app logs beside OS logs; if the user journal is absent, that check has
+  nothing to read on node2 while working on node1 — another divergence, and one
+  that would present as an empty result rather than an error. `podman logs
+  brp-api` works and is the fallback. Not yet diagnosed; suspect journald
+  storage or user-journal configuration on Rocky rather than the unit.
 
 - **`.245` is confirmed free at layer 2 only.** The router's admin UI is not
   available, so it cannot be proven outside the DHCP pool. Accepted on the

@@ -231,12 +231,17 @@ sudo firewall-cmd --reload && sudo firewall-cmd --list-all
 
 ### 1b. App container
 
+**Set `APP_VERSION` in `.env` on both nodes**, not just `NODE_NAME`. It is what
+`/health` reports, and it is the only evidence that a rolling update actually
+landed. `.env.example` ships `dev`; the deployed release is `0.1.0`.
+
 **node1 (Docker):**
 ```bash
 cd ~/bare-metal-reliability-platform
-cp .env.example .env          # set NODE_NAME=node1
+cp .env.example .env          # set NODE_NAME=node1 and APP_VERSION=0.1.0
 docker compose up -d --build
-curl -s localhost:8000/health | jq '{node, version, status}'
+curl -s http://127.0.0.1:8000/health | jq '{node, version, status}'
+docker compose ps             # STATUS must reach (healthy), not just Up
 ```
 
 **node2 (Podman + Quadlet).** Podman is daemonless, so a plain
@@ -245,14 +250,33 @@ it. The systemd Quadlet unit is what makes the container a managed service.
 Full steps (build, linger, install) are in `deploy/podman/README.md`. In brief:
 ```bash
 cd ~/bare-metal-reliability-platform
-cp .env.example .env          # set NODE_NAME=node2
-podman build --build-arg APP_VERSION=0.1.0 -t brp-api:latest .
+cp .env.example .env          # set NODE_NAME=node2 and APP_VERSION=0.1.0
+podman build --format docker --build-arg APP_VERSION=0.1.0 -t brp-api:latest .
 mkdir -p ~/.config/containers/systemd
 cp deploy/podman/brp-api.container ~/.config/containers/systemd/
 sudo loginctl enable-linger "$USER"   # or the unit dies on logout
 systemctl --user daemon-reload && systemctl --user start brp-api
-curl -s localhost:8000/health | jq '{node, version, status}'
+sleep 15
+curl -s http://127.0.0.1:8000/health | jq '{node, version, status}'
+podman ps --format '{{.Names}}\t{{.Status}}'   # Status must show (healthy)
 ```
+
+> **Two node2-only traps, both cases of Docker hiding what Podman surfaces.**
+> Neither announces itself as an error.
+>
+> `--format docker` is **required**. The OCI image format has no healthcheck
+> field, so a default `podman build` discards the Dockerfile's `HEALTHCHECK`
+> and says so only in a build warning you will scroll past. node1's Docker
+> build keeps it. Without the flag the two nodes run different artifacts from
+> one Dockerfile, and node2's container has no health gating at all.
+>
+> Verify with `http://127.0.0.1:8000/health`, **never `localhost`**. Rootless
+> Podman forwards with pasta, which accepts on `::1` and has nothing behind it,
+> so a v6 connection completes its handshake and is then reset. `localhost`
+> resolves `::1` first on Rocky, and because the connect succeeded the client
+> does not fall back to v4 — `curl -s` prints an empty body and exits, which
+> reads as "the app is down" when it is serving fine. `PublishPort` in the
+> Quadlet now pins v4 so `::1` refuses cleanly, but address the literal anyway.
 
 > **SELinux (node2).** If the container cannot bind its port or is denied at
 > startup, check `sudo ausearch -m avc -ts recent`. Do not blanket-disable
@@ -517,8 +541,12 @@ the mistake this whole procedure exists to prevent.
 ```bash
 ssh ericratz@192.168.71.252
 cd ~/bare-metal-reliability-platform
-# rebuild the :latest tag with the new version baked in, restart the unit
-podman build --build-arg APP_VERSION=0.2.0 -t brp-api:latest . && systemctl --user restart brp-api
+# .env FIRST: the Quadlet's EnvironmentFile injects APP_VERSION at runtime and
+# that shadows what the build-arg baked in, so a rebuild alone leaves /health
+# reporting the old version and step 5 below gates on a value nothing changed.
+sed -i 's/^APP_VERSION=.*/APP_VERSION=0.2.0/' .env
+# --format docker or the healthcheck is silently dropped — see §1b
+podman build --format docker --build-arg APP_VERSION=0.2.0 -t brp-api:latest . && systemctl --user restart brp-api
 ```
 
 ### Step 5 — health-check node2 directly, before it takes traffic

@@ -27,11 +27,34 @@ Wants=network-online.target
 [Container]
 Image=localhost/brp-api:latest
 ContainerName=brp-api
-PublishPort=8000:8000
+
+# IPv4 explicitly, NOT a bare `8000:8000`. Rootless Podman forwards with pasta,
+# which binds the wildcard and so accepts on ::1 as well — but the container's
+# uvicorn listens on 0.0.0.0 only, so a v6 connection completes its handshake
+# and is then reset with nothing behind it. `localhost` resolves ::1 first on
+# Rocky, and because the TCP connect SUCCEEDS the client does not fall back to
+# 127.0.0.1: curl reports "Recv failure: Connection reset by peer", or with -s
+# just an empty body. Binding v4 only turns that into a clean refusal on ::1,
+# which clients do fall back from.
+#
+# node1 does not have this problem with the same image: Docker's userland proxy
+# publishes on both families and bridges v6 to the container's v4 socket. Same
+# artifact, different behaviour — see CHANGELOG. Nothing in the platform needs
+# v6 ingress here (nginx upstream, Prometheus targets and the health monitor's
+# endpoints are all v4 literals), so pinning the family costs nothing.
+PublishPort=0.0.0.0:8000:8000
 
 # The one file that differs between nodes. Same NODE_NAME/APP_VERSION/PROM_URL
 # contract as node1's compose, from the same .env, so both nodes are configured
 # identically in shape.
+#
+# CAUTION: this makes .env authoritative for APP_VERSION on this node, which is
+# NOT true on node1. The build-arg bakes ENV APP_VERSION into the image, and
+# this file then overrides it at runtime — the app reads the runtime value
+# (app/core/settings.py). Build with one version and leave .env at another and
+# /health reports .env's, silently. Compose has no such split: it feeds one
+# value to the build-arg, the image tag and the runtime env. Keep the build-arg
+# and .env equal on this node; the rolling update in RUNBOOK.md §2 bumps both.
 EnvironmentFile=%h/bare-metal-reliability-platform/.env
 
 # journald so the health monitor's `journalctl` checks can read app logs next
