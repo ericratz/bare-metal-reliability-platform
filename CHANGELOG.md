@@ -295,6 +295,33 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`systemctl show -p Environment`) rather than reasoning about filenames,
   since a rename in either repo would otherwise flip precedence unannounced.
 
+- **§2 and §3 now say where to run from, and k6 has an install procedure.**
+  Both sections drive traffic at the VIP, which is reachable only from the lab
+  LAN — the workstation is NAT'd off it. Neither section said so, which would
+  have stopped the first measured run at its first command.
+
+  **k6 runs on node2**, capped at `MAX_VUS=50`. It is not packaged for Rocky 10;
+  installed as a static binary from the upstream release, with the same
+  no-distro-security-updates caveat as Prometheus in §1d, accepted for the same
+  kind of reason — an operator tool run by hand, listening on nothing.
+
+  The honest part: **node2 is also one of the two backends under test.** There
+  is no third machine on the LAN, so this is a constraint, not a preference.
+  node2 is the less bad end of it, because node1 holds the VIP *and* is the
+  nginx every request traverses, which would put client, balancer, VRRP master
+  and backend on one 2-core box. What it costs is per-node `p95_latency_ms`,
+  which now includes k6's own consumption and must not be quoted as a clean
+  figure. What it does not cost is the zero-dropped-requests result, which
+  counts failed responses and is indifferent to which host asked. `maxVUs` is
+  capped because an open-model executor allocates VUs to hold the request rate
+  steady, so an unbounded ceiling turns a latency blip into a self-inflicted
+  load spike that the test then reports as the platform's fault.
+
+  Also: §2 step 7 said only "same sequence" for node1, while node1 is Compose
+  and node2 is a Quadlet — the node1 update command existed nowhere. Written
+  out. And the k6 summary writes to `evidence/`, which k6 will not create, so
+  step 0 makes the directory first.
+
 ### Fixed
 
 *This is what `0.2.0` carries.* §2 proves a rolling update by showing `version`
@@ -354,6 +381,39 @@ pending item ever since.
   a permission error on both nodes. Local-only artifact of how the file was
   created; invisible on the workstation because it had never been run from a
   fresh clone.
+
+- **Both k6 scripts reported per-node traffic by scraping a metric key format
+  that k6 v2 does not produce.** Found on the first real run of either script —
+  they had never been executed anywhere, which is why this survived to now.
+  `Counter.add(1, {node})` records the tag on each sample, but the tag-split
+  sub-metric only reaches `handleSummary` if k6 materialises it, and the key it
+  arrives under (`node_hits{node:node1}`) is an output detail, not an API.
+
+  The two failures were different, and the second is the worse one:
+
+  - `rolling-update.js` printed `total requests : 601`, `failed : 0`, and
+    `ZERO DROPPED REQUESTS` above an **empty `served by:` section**. Half of
+    §2 step 8's check vanished under a headline that said the run passed.
+  - `baseline.js` would have printed `no /health responses carried a node
+    field` — not a missing result but a *wrong diagnosis*, blaming the app for
+    omitting a field it had faithfully returned on every request. Since the
+    per-node split is the only thing that script exists to produce, it would
+    have sent someone to debug the wrong component entirely.
+
+  Both now use one metric per node (`node_hits_node1`, `node_latency_node1`, …)
+  instead of one metric tagged by node. Explicit metrics are always present in
+  `data.metrics`, so the summary cannot silently lose a dimension when an
+  output format changes. A `node_hits_unknown` counter catches a `node` value
+  that is neither — that means `NODE_NAME` is wrong somewhere, which
+  misattributes every per-node number and previously looked identical to a node
+  serving no traffic. `rolling-update.js` also says so explicitly when nothing
+  could be attributed, rather than printing an empty list: a blank section
+  reads as "nothing to report" when it means "the reporting broke."
+
+  `baseline.js` now also prints per-node p95, which its own closing advice
+  ("if p95 differs sharply between nodes…") has always told the reader to
+  compare while never actually showing it — the Trend was tagged by node and
+  therefore just as unreachable.
 
 `status` deliberately stays `"ok"` when Prometheus answers but every metric is
 null. It reports whether the endpoint could do its job, not whether traffic

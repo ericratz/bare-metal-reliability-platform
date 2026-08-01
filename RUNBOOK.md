@@ -900,14 +900,24 @@ run by hand, not a service listening on anything.
 
 ```bash
 ssh ericratz@192.168.71.252
-K6_VERSION=$(curl -fsSL https://api.github.com/repos/grafana/k6/releases/latest | jq -r .tag_name)
+K6_VERSION=$(curl -fsSL --max-time 30 https://api.github.com/repos/grafana/k6/releases/latest | jq -r .tag_name)
 echo "$K6_VERSION"     # sanity-check it looks like v1.2.3 before continuing
-curl -fsSL "https://github.com/grafana/k6/releases/download/${K6_VERSION}/k6-${K6_VERSION}-linux-amd64.tar.gz" -o /tmp/k6.tar.gz
+# --progress-bar, not -s. The tarball is tens of MB and node2's link is slow —
+# this took ~3 minutes in practice. Silenced, a slow download is indistinguishable
+# from a hung one, and the natural response is to Ctrl-C a working transfer.
+curl -fL --progress-bar --connect-timeout 10 --max-time 600 \
+  "https://github.com/grafana/k6/releases/download/${K6_VERSION}/k6-${K6_VERSION}-linux-amd64.tar.gz" \
+  -o /tmp/k6.tar.gz
 tar -xzf /tmp/k6.tar.gz -C /tmp
 sudo install -m 0755 "/tmp/k6-${K6_VERSION}-linux-amd64/k6" /usr/local/bin/k6
 sudo restorecon -v /usr/local/bin/k6
 k6 version
 ```
+
+If it appears to stall, check whether it is actually moving before killing it —
+`ls -l /tmp/k6.tar.gz` twice, a few seconds apart. Note the download redirects
+to `objects.githubusercontent.com`, so it costs a second DNS lookup on a
+different name than the API call above.
 
 If the download 404s, check the asset name on the releases page — the archive
 layout is upstream's to change, and this is the one step here that depends on it.
@@ -1039,8 +1049,20 @@ Then step 5's direct health check against `192.168.71.251:8000`, and
 ### Step 8 — close out the evidence
 
 Ctrl-C terminal A, read the summary (want `failed : 0`, both nodes present in
-the by-node breakdown). Let k6 finish; it must report `http_req_failed
-rate==0`. Keep the log in `evidence/`.
+the by-node breakdown with non-zero counts). Let k6 finish, then:
+
+```bash
+echo $?
+```
+
+`0` or nothing failed. The script's `handleSummary` **replaces** k6's default
+summary, so the `http_req_failed rate==0` threshold verdict is never printed —
+the exit code is the only place it surfaces. The `failed : 0` line in the
+custom summary asserts the same thing and is derived from the same metric, so
+the two must agree; if they ever disagree, trust the exit code and find out why
+before quoting either.
+
+Keep the log in `evidence/`.
 
 ### If requests were dropped
 

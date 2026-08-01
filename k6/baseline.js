@@ -9,9 +9,24 @@ import { Rate, Counter, Trend } from 'k6/metrics';
 //
 //  k6 run -e BASE_URL=http://192.168.71.245 k6/baseline.js
 
-const errorRate   = new Rate('errors');
-const nodeHits    = new Counter('node_hits');
-const nodeLatency = new Trend('node_latency', true);
+const errorRate = new Rate('errors');
+
+//One metric per node rather than one metric tagged by node — see the comment in
+//rolling-update.js. Tag-split sub-metrics do not reliably reach handleSummary,
+//and the failure here was worse than an empty section: this script would have
+//reported "no /health responses carried a node field", which is a diagnosis of
+//the wrong component. The responses were fine; the metric keys were not where
+//the summary looked. The per-node split is the only thing this script exists to
+//produce, so it must not be able to fail quietly.
+const nodeHits = {
+  node1: new Counter('node_hits_node1'),
+  node2: new Counter('node_hits_node2'),
+};
+const nodeLatency = {
+  node1: new Trend('node_latency_node1', true),
+  node2: new Trend('node_latency_node2', true),
+};
+const unknownNode = new Counter('node_hits_unknown');
 
 const BASE_URL = __ENV.BASE_URL || 'http://localhost';
 
@@ -44,8 +59,12 @@ export default function () {
     try {
       const node = res.json('node');
       if (node) {
-        nodeHits.add(1, { node });
-        nodeLatency.add(res.timings.duration, { node });
+        if (nodeHits[node]) {
+          nodeHits[node].add(1);
+          nodeLatency[node].add(res.timings.duration);
+        } else {
+          unknownNode.add(1);
+        }
       }
     } catch (_) {
       //body was not JSON — already counted as a failure by the check above
@@ -56,33 +75,47 @@ export default function () {
 }
 
 export function handleSummary(data) {
-  //k6's default summary reports node_hits as one total. The per-node split is
-  //the number we actually came for, so pull it out of the sub-metrics.
+  //The per-node split is the number we actually came for; k6's own summary only
+  //reports totals.
   const lines = ['', '=== traffic distribution by node ==='];
+  const nodes = ['node1', 'node2'];
   const counts = {};
   let total = 0;
 
-  for (const [name, metric] of Object.entries(data.metrics)) {
-    const m = name.match(/^node_hits\{node:(.+)\}$/);
-    if (m) {
-      const n = metric.values.count;
-      counts[m[1]] = n;
-      total += n;
-    }
+  for (const node of nodes) {
+    const metric = data.metrics[`node_hits_${node}`];
+    const n = metric ? metric.values.count : 0;
+    counts[node] = n;
+    total += n;
   }
 
+  const unknown = data.metrics.node_hits_unknown;
+  const unknownCount = unknown ? unknown.values.count : 0;
+
   if (total === 0) {
-    lines.push('  no /health responses carried a node field');
+    lines.push('  no /health response was attributed to a known node');
+    lines.push('  (either none carried a node field, or every value was unrecognised)');
   } else {
-    for (const [node, n] of Object.entries(counts).sort()) {
+    for (const node of nodes) {
+      const n = counts[node];
       const pct = ((n / total) * 100).toFixed(1);
-      lines.push(`  ${node.padEnd(8)} ${String(n).padStart(6)} req  ${pct.padStart(5)}%`);
+      const latency = data.metrics[`node_latency_${node}`];
+      const p95Value = latency ? latency.values['p(95)'] : undefined;
+      const p95 = typeof p95Value === 'number' ? `  p95 ${p95Value.toFixed(1)}ms` : '';
+      lines.push(`  ${node.padEnd(8)} ${String(n).padStart(6)} req  ${pct.padStart(5)}%${p95}`);
     }
     lines.push('');
     lines.push('  Compare against the weights in deploy/nginx/brp-upstream.conf.');
     lines.push('  If the observed split matches the configured weights but p95');
     lines.push('  differs sharply between nodes, the weights are wrong for the');
     lines.push('  hardware — retune toward equal per-node latency, not equal load.');
+  }
+
+  if (unknownCount > 0) {
+    lines.push('');
+    lines.push(`  UNKNOWN  ${unknownCount} req served by a node naming itself neither`);
+    lines.push('  node1 nor node2. NODE_NAME is wrong somewhere, and every split');
+    lines.push('  above is measured against an incomplete denominator.');
   }
 
   return {

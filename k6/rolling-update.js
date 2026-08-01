@@ -10,7 +10,21 @@ import { Counter } from 'k6/metrics';
 //
 //Start this BEFORE step 1 of RUNBOOK.md and let it run past the final step.
 
-const nodeHits = new Counter('node_hits');
+//One counter per node, not one counter tagged by node. A tagged Counter records
+//the tag on every sample, but the tag-split sub-metrics only reach
+//handleSummary if k6 materialises them, and the key they arrive under
+//(`node_hits{node:node1}`) is an output detail rather than an API. Scraping
+//that key printed an empty `served by:` section under k6 v2 while the request
+//count was correct — the run looked fully verified with half its evidence
+//silently missing, which is the failure mode this whole repo is about.
+const nodeHits = {
+  node1: new Counter('node_hits_node1'),
+  node2: new Counter('node_hits_node2'),
+};
+//A `node` value that is neither gets its own counter instead of being dropped:
+//it means NODE_NAME is wrong somewhere, which misattributes every per-node
+//number in the run and would otherwise look identical to a node serving nothing.
+const unknownNode = new Counter('node_hits_unknown');
 const failures = new Counter('failed_requests');
 
 const BASE_URL = __ENV.BASE_URL || 'http://localhost';
@@ -65,7 +79,7 @@ export default function () {
 
   try {
     const node = res.json('node');
-    if (node) nodeHits.add(1, { node });
+    if (node) (nodeHits[node] || unknownNode).add(1);
   } catch (_) {
     //non-JSON 200 — unexpected, but the check above already passed it
   }
@@ -90,10 +104,33 @@ export function handleSummary(data) {
 
   lines.push('');
   lines.push('  served by:');
-  for (const [name, metric] of Object.entries(data.metrics)) {
-    const m = name.match(/^node_hits\{node:(.+)\}$/);
-    if (m) lines.push(`    ${m[1].padEnd(8)} ${metric.values.count}`);
+
+  const count = (name) => {
+    const m = data.metrics[name];
+    return m ? m.values.count : 0;
+  };
+  const attributed = count('node_hits_node1') + count('node_hits_node2');
+
+  for (const node of ['node1', 'node2']) {
+    lines.push(`    ${node.padEnd(8)} ${count(`node_hits_${node}`)}`);
   }
+
+  const unknown = count('node_hits_unknown');
+  if (unknown > 0) {
+    lines.push(`    UNKNOWN  ${unknown}`);
+    lines.push('    ^ /health reported a node name that is neither node1 nor node2.');
+    lines.push('      NODE_NAME is wrong on some node; per-node numbers are unsafe.');
+  }
+
+  if (attributed === 0 && total > 0) {
+    //Explicit, because a silently empty section is what this replaced: it read
+    //as "nothing to report" when it meant "the reporting broke".
+    lines.push('');
+    lines.push('  NO PER-NODE ATTRIBUTION — requests succeeded but none carried a');
+    lines.push('  usable node field. The zero-dropped result above still stands;');
+    lines.push('  the by-node half of RUNBOOK.md §2 step 8 does not.');
+  }
+
   lines.push('');
   lines.push('  Both nodes should appear, and each should show a stretch of zero');
   lines.push('  traffic in the Nginx access log while it was out of the pool.');
