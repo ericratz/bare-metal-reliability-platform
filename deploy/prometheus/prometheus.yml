@@ -9,8 +9,11 @@
 #Consequence worth knowing: the two instances are not synchronised, so their
 #numbers can differ by up to one scrape interval. That is expected, not drift.
 #
-#Running Prometheus on both also lets PROM_URL be 127.0.0.1:9090 everywhere, so
-#/slo never crosses the network — see README on why that coupling mattered.
+#Running Prometheus on both also lets PROM_URL be one identical value
+#everywhere, so /slo always reads THIS node's instance and never the peer's.
+#That value is host.docker.internal:9090, not 127.0.0.1 — the app is in a
+#container and Prometheus is on the host, so loopback names the container. See
+#.env.example and RUNBOOK.md §1d.
 #
 #No Grafana: at two nodes the expression browser plus the Alerts tab covers it,
 #and Grafana's baseline RAM is not worth spending here.

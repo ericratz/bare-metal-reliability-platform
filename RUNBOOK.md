@@ -129,6 +129,7 @@ Traffic that must be allowed:
 | 80/tcp | anywhere on LAN | nginx ingress (via VIP) |
 | 8000/tcp | both nodes | app; nginx upstream + Prometheus scrape |
 | 9090/tcp | both nodes | Prometheus; peer scrape |
+| 9090/tcp | node1's container subnet | `/slo` → local Prometheus; **node1 only**, added at §1d |
 | VRRP (proto 112) | the other node | keepalived adverts |
 
 **node1 (Ubuntu, ufw):**
@@ -542,7 +543,7 @@ moment you compare them, which is the only reason the label exists.
 **Validate, then start — both nodes:**
 
 ```bash
-sudo promtool check config /etc/prometheus/prometheus.yml
+/usr/local/bin/promtool check config /etc/prometheus/prometheus.yml
 sudo systemctl daemon-reload && sudo systemctl enable --now prometheus && sudo systemctl restart prometheus
 systemctl is-active prometheus
 ```
@@ -551,6 +552,19 @@ systemctl is-active prometheus
 covers `/etc/prometheus/rules/*.yml` without a separate `check rules` run. The
 explicit `restart` is for the same reason as §1c — `--now` is a no-op if the
 unit is somehow already active, and here it costs nothing.
+
+> **No `sudo`, and an absolute path — both deliberate.** The config is
+> world-readable, so root is not needed. More importantly `sudo promtool` works
+> on node1 and fails with `command not found` on node2: RHEL's sudoers
+> `secure_path` is `/sbin:/bin:/usr/sbin:/usr/bin`, which excludes
+> `/usr/local/bin`, while Debian's includes it. The binary is installed
+> identically on both nodes and is on the interactive `PATH` on both — it is
+> only invisible *through sudo* on node2.
+>
+> `prometheus.service` is unaffected because `ExecStart` is already absolute.
+> Worth knowing beyond this step: any locally-installed tool invoked with
+> `sudo` on node2 needs its full path, and the error names the command rather
+> than the cause, so it reads like a failed install.
 
 If node2 fails to start where node1 succeeded, read the denial before assuming
 the unit is wrong: `sudo journalctl -u prometheus -n 30 --no-pager` and
@@ -578,11 +592,60 @@ Prometheus: `external_labels` are attached to federation, remote-write and
 alerts — never to local query results — so `query=up` will not show them and is
 not a check.
 
+**Point the app at Prometheus — it is not reachable from the container yet.**
+`/slo` will report `status: unavailable` until this is done, and that report is
+accurate: the app runs in a container, Prometheus runs on the host, and the
+original `PROM_URL=http://127.0.0.1:9090` names the container's own loopback
+where nothing listens. This was wrong from §1b onward and only became visible
+here, because before §1d there was no Prometheus to fail to reach.
+
+`host.docker.internal` resolves to the host under both runtimes — Podman
+aliases it natively, and `docker-compose.yml` maps it with
+`extra_hosts: host-gateway` — so `PROM_URL` is one identical value on both
+nodes.
+
+**node1 (Docker + ufw).** Needs a firewall rule as well, and the container must
+be recreated because the Compose network's subnet is now pinned:
+
+```bash
+# §1a's 9090 rule allows 192.168.68.0/22 only; the container's source address
+# is on the Docker bridge, so container-to-host :9090 is DROPPED — a timeout,
+# not a refusal, which is what makes it read as a hung Prometheus.
+sudo ufw allow from 172.28.0.0/24 to any port 9090 proto tcp
+sudo ufw status | grep 9090
+
+cd ~/bare-metal-reliability-platform
+sed -i 's|^PROM_URL=.*|PROM_URL=http://host.docker.internal:9090|' .env
+# down, not restart: the pinned `networks:` subnet only applies on recreate
+docker compose down && docker compose up -d
+```
+
+**node2 (Podman).** Config only — pasta routes the container to the host
+directly and firewalld never sees the traffic:
+
+```bash
+cd ~/bare-metal-reliability-platform
+sed -i 's|^PROM_URL=.*|PROM_URL=http://host.docker.internal:9090|' .env
+systemctl --user restart brp-api
+```
+
+**Verify on both before registering:**
+
+```bash
+curl -s http://127.0.0.1:8000/slo | jq '{status, availability_percent}'
+```
+
+`status` must not be `unavailable`. Note what a correct-but-idle answer looks
+like, so it is not mistaken for a fault: an empty query result yields per-metric
+defaults (availability `1.0`), *not* nulls — unreachable and empty are
+deliberately distinct, and only unreachable produces nulls.
+
 **Register.** Add `prometheus.service` to `HEALTH_SERVICES`, and this node's
 `http://127.0.0.1:8000/slo` (the `fleet-slo` entry) to `HEALTH_APP_ENDPOINTS`
-— not before now. `/slo` reads from local Prometheus and degrades to
-`status: unavailable` without it, so registering it any earlier books a
-guaranteed failure against the baseline you are trying to keep quiet.
+— not before now, and not before the check above passes. `/slo` reads from
+local Prometheus and degrades to `status: unavailable` without it, so
+registering it any earlier books a guaranteed failure against the baseline you
+are trying to keep quiet.
 
 ### 1e. keepalived (both nodes)
 

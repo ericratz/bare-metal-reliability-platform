@@ -13,6 +13,14 @@ services:
     restart: unless-stopped
     ports:
       - "8000:8000"
+    #/slo queries Prometheus, which runs on the HOST, not in this container.
+    #PROM_URL was 127.0.0.1:9090 and could never have worked from in here —
+    #that is the container's own loopback. Podman supplies
+    #host.containers.internal automatically and also aliases
+    #host.docker.internal; adding it here gives both runtimes the same name, so
+    #PROM_URL stays one identical value on both nodes.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       #no default: an instance that does not know which node it is on would
       #report "unknown" to the LB, Prometheus, and the health monitor at once.
@@ -24,3 +32,17 @@ services:
     #stack still comes up on a dev box without systemd.
     logging:
       driver: ${LOG_DRIVER:-json-file}
+
+#Pinned rather than left to Docker's address pool, because node1's ufw rule for
+#container-to-host :9090 has to name a source subnet — and a rule pointing at a
+#range Docker picked at random stops matching the moment the network is
+#recreated. Compose had assigned 172.18.0.0/16 here; that was luck, not a
+#contract. See RUNBOOK.md §1d.
+#
+#node2 needs no equivalent: pasta routes the container to the host directly and
+#firewalld never sees the traffic.
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24

@@ -166,6 +166,16 @@ stating: **a liveness check must not depend on a remote system it is meant to be
 independent of.** `/health` makes no network calls and answers in ~15ms;
 fleet-wide SLO numbers live on `/slo`.
 
+The deploy proved the point harder than intended. `/slo` was configured with
+`PROM_URL=http://127.0.0.1:9090` on the reasoning that Prometheus is node-local
+— but the app runs in a container and Prometheus runs on the host, so that
+address named the container's own loopback and `/slo` could never reach
+Prometheus at all. It now uses `host.docker.internal`, which both runtimes
+resolve. Each node still queries only its own Prometheus; what was wrong was
+the claim that this involved no network hop. Had `/health` still depended on
+Prometheus, this would have been a fleet-wide outage of the signal that gates
+nodes back into the pool, rather than one degraded endpoint.
+
 A related fix: the original `safe_query` returned `0.0` both when Prometheus was
 unreachable and when a query matched nothing, so an unreachable Prometheus
 rendered as **`availability_percent: 0.0`** — a healthy system reporting a total

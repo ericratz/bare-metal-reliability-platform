@@ -6,6 +6,42 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **`PROM_URL=http://127.0.0.1:9090` could never have worked.** The app runs in
+  a container and Prometheus runs on the host, so that address names the
+  container's own loopback, where nothing listens. `/slo` reported
+  `status: unavailable` on both nodes the moment Prometheus existed — correctly,
+  since the app genuinely could not reach it. Wrong since §1b; invisible until
+  §1d, because until then there was no Prometheus to fail to reach.
+
+  This also corrects the 0.1.0 entry below and the README, both of which said
+  the move to `127.0.0.1:9090` meant `/slo` "never crosses the network." The
+  *intent* holds — each node queries only its own Prometheus, never the peer's
+  — but the mechanism described does not exist under a container runtime. Left
+  as written below; this is the correction.
+
+  Now `http://host.docker.internal:9090`, which resolves to the host under both
+  runtimes: Podman aliases it natively alongside `host.containers.internal`,
+  and `docker-compose.yml` maps it via `extra_hosts: host-gateway`. One
+  identical value on both nodes, which is the reason for preferring a name over
+  either node's address.
+- **node1 additionally needed a ufw rule, and the Compose network subnet is now
+  pinned to make that rule durable.** §1a opens `9090` to `192.168.68.0/22`, but
+  a container's source address is on the Docker bridge, so container-to-host
+  `:9090` was dropped. The symptom was a *timeout* rather than a refusal, which
+  reads as a hung Prometheus rather than a blocked packet — node1's loopback
+  test refused immediately while the gateway test hung, and that difference is
+  what identified it.
+
+  `docker-compose.yml` now pins `172.28.0.0/24` instead of accepting Docker's
+  address pool, because a firewall rule naming a subnet Docker chose at random
+  silently stops matching the first time the network is recreated. Compose had
+  assigned `172.18.0.0/16`; that was luck, not a contract.
+
+  node2 needed neither change: pasta routes the container to the host directly
+  and firewalld never sees the traffic. Same logical connection, working out of
+  the box on one node and requiring pinned addressing plus an explicit firewall
+  rule on the other.
+
 - **`RUNBOOK.md` §1c assumed nginx was installed, that the distro ships no
   conflicting server block, and that `systemctl enable --now` starts what you
   configured.** All three were wrong, and in different ways per OS:
