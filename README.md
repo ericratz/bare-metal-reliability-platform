@@ -284,12 +284,15 @@ Verified locally: app port, container build, Prometheus config + rules
 injected-outage detection). Both nodes provisioned with static IPs and their
 container runtimes.
 
-**On real hardware, through `RUNBOOK.md` §1c:** firewalls configured per OS
+**On real hardware, through `RUNBOOK.md` §1d:** firewalls configured per OS
 (§1a), linux-health-monitor v3.2 running as a timer on both nodes (§1·1), the
 app tier serving on both (§1b) — Docker Compose on node1, a rootless Podman
-Quadlet unit on node2, both answering `/health` as `0.1.0` — and nginx serving
-on both (§1c), each balancing across both backends, with the monitor's HTML
-report served at `/report`. Both nodes' monitor runs exit 0.
+Quadlet unit on node2, both answering `/health` as `0.1.0` — nginx serving on
+both (§1c), each balancing across both backends, with the monitor's HTML report
+at `/report`, and redundant Prometheus (§1d): 3.13.2 from the same upstream
+tarball on both nodes, each scraping both nodes, four targets up from each
+instance's point of view, with `/slo` answering. Both nodes' monitor runs
+exit 0.
 
 **The 1:1 upstream split is now measured rather than assumed:** 40 sequential
 requests through node2's load balancer resolved 19/21 across the two nodes.
@@ -320,13 +323,19 @@ not. Details in `CHANGELOG.md`.
 
 Pending:
 
-- [ ] Prometheus and keepalived on both nodes (§1d–§1e)
+- [ ] keepalived and the VIP on both nodes (§1e)
 - [ ] Rolling update and VIP failover executed and measured on real hardware
+- [ ] SLO numbers are not yet real — with almost no traffic, `/slo` reports
+      `availability_percent: 100.0` from an empty-result *default* rather than
+      a measurement, alongside a null error rate. k6 in §2 is what makes them
+      mean something
 - [ ] node2's app logs are not reachable via `journalctl --user`, so the
       monitor's journal check has nothing to read there; `podman logs` works
 - [ ] `httpd_can_network_connect` was set on node2 pre-emptively and is not
       proven to have been required — unlike the `/var/www/health` relabel,
       which `restorecon` confirmed
+- [ ] Prometheus is installed from a tarball and gets no distro security
+      updates on either node; upgrades are manual and unmonitored
 
 Deferred: Alertmanager routing (rules evaluate and display in Prometheus's UI,
 they just do not notify anywhere yet).

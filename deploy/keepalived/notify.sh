@@ -23,5 +23,23 @@ TYPE="${1:-?}"
 NAME="${2:-?}"
 STATE="${3:-?}"
 
+# %N and truncate here, NOT %3N. Ubuntu 26.04 ships the Rust coreutils, whose
+# `date` ignores the width modifier and emits nine digits; GNU date on Rocky
+# honours it and emits three. The pair therefore logged two different timestamp
+# formats, which makes correlating a failover ACROSS the two nodes manual work
+# — and correlating the two nodes is the entire reason this file exists.
+# Truncating in bash gives byte-identical output from either implementation.
+TS="$(date -u +%Y-%m-%dT%H:%M:%S.%N)"
+TS="${TS:0:23}Z"
+
+# $HOSTNAME is a bash builtin and costs no exec. $(hostname) was used here and
+# returned EMPTY on node2: under SELinux, keepalived_t is denied even getattr
+# on hostname_exec_t, so the child process cannot run it. Confirmed by AVC, not
+# inferred — the binary is installed and works fine from a normal shell.
+#
+# The failure was silent in the worst way: the line still logged, still parsed,
+# and merely lost the field identifying which node emitted it.
+HOST="${HOSTNAME:-unknown}"
+
 logger -t keepalived-notify \
-    "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ) type=${TYPE} instance=${NAME} state=${STATE} host=$(hostname)"
+    "${TS} type=${TYPE} instance=${NAME} state=${STATE} host=${HOST}"

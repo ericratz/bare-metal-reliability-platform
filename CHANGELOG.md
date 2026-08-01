@@ -6,6 +6,39 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **`notify.sh` logged a different format on each node, and the platform gave
+  no sign of it.** This is the file the zero-downtime claim rests on — it
+  timestamps every VRRP transition so a failover can be correlated against the
+  per-request log and turned into a real number. Both defects were found by
+  reading the two nodes' output side by side after §1e brought keepalived up,
+  not by anything failing:
+
+  - **`host=` was empty on node2.** `$(hostname)` returned nothing because
+    SELinux denies `keepalived_t` even `getattr` on `hostname_exec_t` — the
+    binary is installed and works from a normal shell, but not from a child of
+    keepalived. node1 is unconfined and had no such problem. Now uses the
+    `$HOSTNAME` bash builtin, which needs no exec. The failure mode is the
+    quiet kind: the line still logged and still parsed, it merely dropped the
+    field saying which node emitted it.
+  - **The timestamps had different precision.** The script asked for `%3N`
+    (milliseconds); Rocky's GNU `date` honoured it and emitted three digits,
+    while Ubuntu 26.04 ships the Rust coreutils, whose `date` ignores the width
+    modifier and emitted nine. Now takes `%N` and truncates in bash, which is
+    byte-identical under both. Same family as `tail -5` being rejected on
+    node1 — Ubuntu's coreutils replacement is a standing source of these.
+
+  Neither would have surfaced until someone tried to correlate a failover
+  across both nodes during a drill, which is exactly when the instrument needs
+  to be trustworthy.
+- **Documented the two SELinux AVCs keepalived raises on node2**, and left the
+  benign one alone. The `setattr` denials on `check_nginx.sh` and `notify.sh`
+  come from `install` labelling them `etc_t`; keepalived is refused and carries
+  on regardless — `VRRP_Script(check_nginx) succeeded` appears in the same log.
+  Silencing it would mean shipping a local policy module to suppress a denial
+  that breaks nothing, which trades a harmless log line for custom policy
+  nobody will remember writing. `RUNBOOK.md` §1e now says which denial matters
+  and which does not, since the audit log shows both together.
+
 - **`PROM_URL=http://127.0.0.1:9090` could never have worked.** The app runs in
   a container and Prometheus runs on the host, so that address names the
   container's own loopback, where nothing listens. `/slo` reported
@@ -208,6 +241,31 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`deploy/prometheus/prometheus.service` — Prometheus installed from the
+  upstream tarball on both nodes rather than from a package.** Ubuntu carries
+  `prometheus` in universe (2.53.x); Rocky 10 carries it in no enabled repo at
+  all, and EPEL dropped it after EL8. Package-where-available would have put a
+  2.x collector on node1 and a 3.x on node2, with different unit files, service
+  users and data paths.
+
+  That is specifically disqualifying here. The hardware is identical so that
+  any per-node difference in the metrics is attributable to the OS; two
+  different collector versions would hand every such difference a second
+  candidate explanation and quietly void the measurement the whole two-node
+  setup exists to make. Both nodes now run 3.13.2 from the same tarball, the
+  same shipped unit, and the same config — `external_labels.replica` is the
+  only line that differs.
+
+  The cost is stated rather than hidden: this binary gets no distro security
+  updates, and upgrading means repeating the install on both nodes by hand.
+- **`sudo promtool` works on node1 and not on node2.** RHEL's sudoers
+  `secure_path` is `/sbin:/bin:/usr/sbin:/usr/bin` and excludes
+  `/usr/local/bin`; Debian's includes it. The binary is installed identically
+  and is on the interactive `PATH` on both nodes — it is invisible only
+  *through sudo*, and the error names the command rather than the cause, so it
+  reads as a failed install. `prometheus.service` is unaffected because
+  `ExecStart` is absolute. §1d now validates without `sudo`, which it never
+  needed: the config is world-readable.
 - `RUNBOOK.md` §1 now registers each component with the health monitor as part
   of the step that deploys it. `HEALTH_SERVICES` and `HEALTH_APP_ENDPOINTS`
   start trimmed to what exists, so the monitor's exit code is meaningful from

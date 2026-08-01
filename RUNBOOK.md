@@ -699,30 +699,134 @@ correct on `.250` and never legitimate on `.245`.
 > re-run the `ip neigh` check from both nodes, and grep — the VIP appears in
 > seven files, so do not edit from memory.
 
+**Pre-flight — all three checks, on both nodes, before installing anything.**
+This is the only step in §1 that can take a working platform down rather than
+merely fail to come up, and each of these failures is silent:
+
 ```bash
+# 1. The interface name is hardcoded in both keepalived configs, in the MAC
+#    table above, and in every verification below. Confirm it is enp1s0.
+ip -br link | grep -v LOOPBACK
+
+# 2. VRRP must be permitted or BOTH nodes claim the VIP. node1's rule lives in
+#    before.rules and `ufw status` will NEVER show it — this grep is the only
+#    confirmation that exists.
+sudo iptables -S ufw-before-input | grep 112          # node1
+sudo firewall-cmd --list-protocols                    # node2 — expect vrrp
+
+# 3. Re-check that .245 is still unanswered. The earlier check was days ago and
+#    a DHCP lease could have landed on it since. Run from BOTH nodes.
+#    node1's image ships no ping — fifth missing tool there after arping, ufw,
+#    an editor and jq. Install it (the §3 drills want it) or trigger the ARP
+#    resolution with curl instead; what matters is the neighbour state, not
+#    which tool provoked it.
+command -v ping || sudo apt-get install -y iputils-ping    # node1
+ping -c2 -W1 192.168.71.245; ip neigh | grep 192.168.71.245
+```
+
+Check 3 must find nothing — no reply, and a neighbour entry that is
+`INCOMPLETE` or `FAILED` rather than one naming a MAC. If something answers, **stop** — assigning the VIP
+on top of a live host produces an intermittent conflict that is far harder to
+diagnose than this check is to run. Pick another address in the same top band
+and grep: the VIP appears in seven files, so do not edit from memory.
+
+**Install keepalived.** Not present on either node:
+
+```bash
+command -v keepalived || sudo apt-get install -y keepalived    # node1
+command -v keepalived || sudo dnf install -y keepalived        # node2
+```
+
+**Install the config and scripts:**
+
+```bash
+cd ~/bare-metal-reliability-platform
 # node1:
-sudo cp deploy/keepalived/keepalived-node1.conf /etc/keepalived/keepalived.conf
+sudo install -m 644 deploy/keepalived/keepalived-node1.conf /etc/keepalived/keepalived.conf
 # node2:
-sudo cp deploy/keepalived/keepalived-node2.conf /etc/keepalived/keepalived.conf
-# both:
-sudo cp deploy/keepalived/check_nginx.sh deploy/keepalived/notify.sh /etc/keepalived/
-sudo chmod 755 /etc/keepalived/check_nginx.sh /etc/keepalived/notify.sh
-sudo systemctl enable --now keepalived
+sudo install -m 644 deploy/keepalived/keepalived-node2.conf /etc/keepalived/keepalived.conf
+# both — root-owned and 755, or enable_script_security refuses to run them:
+sudo install -m 755 -o root -g root deploy/keepalived/check_nginx.sh deploy/keepalived/notify.sh /etc/keepalived/
+ls -l /etc/keepalived/
 ```
 
-Verify the VIP is up on **exactly one** node (node1 while healthy):
+**Bring node1 up FIRST, alone, and confirm it takes the VIP.** Order matters
+here and the reason is `nopreempt`: whichever node reaches MASTER first keeps
+the VIP, because a nopreempt BACKUP will not take over from a healthy peer even
+at higher priority. Start node2 first and you get a working platform with the
+roles inverted from every diagram and drill in this repo.
+
 ```bash
-# node1 — should show 192.168.71.245:
-ip addr show enp1s0 | grep 192.168.71.245
-# node2 — should show NOTHING:
-ip addr show enp1s0 | grep 192.168.71.245
-# from anywhere:
-curl -s http://192.168.71.245/health | jq '{node, status}'
-watch -n1 'journalctl -t keepalived-notify -n3 --no-pager'
+# node1 only:
+sudo systemctl enable --now keepalived && sudo systemctl restart keepalived
+sleep 5
+ip addr show enp1s0 | grep 192.168.71.245        # MUST show the VIP
+journalctl -t keepalived-notify -n5 --no-pager   # expect state=MASTER
 ```
 
-If the VIP appears on **both** nodes, VRRP adverts are not getting through —
-recheck 1a.
+The explicit `restart` is for the same reason as §1c and §1d — Debian starts a
+service on install, so keepalived may already be running against a config that
+did not exist yet, and `--now` is a no-op on an active unit.
+
+**Then node2, and confirm it does NOT take the VIP:**
+
+```bash
+# node2 only:
+sudo systemctl enable --now keepalived && sudo systemctl restart keepalived
+sleep 5
+ip addr show enp1s0 | grep 192.168.71.245        # MUST print NOTHING
+journalctl -t keepalived-notify -n5 --no-pager   # expect state=BACKUP
+```
+
+**If the VIP appears on both nodes, that is split brain** — VRRP adverts are
+not getting through, and pre-flight check 2 is where to look. Traffic then goes
+to whichever node the switch's ARP cache learned last, so it will *appear* to
+work intermittently. Stop keepalived on node2 and fix the firewall before
+continuing.
+
+**Verify the VIP actually serves — run from a node, not the workstation.** The
+workstation is NAT'd off this LAN, so it cannot reach `.245` at all and a
+failure there means nothing:
+
+```bash
+curl -s http://192.168.71.245/health | jq '{node, status}'
+curl -s http://192.168.71.245/nginx-health
+```
+
+`node` may be either node1 or node2 — the VIP lands on node1's nginx, which
+balances across both backends. That is correct, not a fault.
+
+> **node2 and SELinux — check this even though the platform looks fine.**
+> keepalived runs confined in `keepalived_t` on RHEL and node1 has no
+> equivalent confinement, so every script keepalived runs is subject to denials
+> that simply do not exist on node1:
+>
+> ```bash
+> sudo journalctl -u keepalived -n 30 --no-pager | grep -i 'script\|fault\|fail'
+> sudo ausearch -m avc -ts recent
+> ```
+>
+> Two denials are expected here, and they are not equally serious:
+>
+> - **`getattr` on `/usr/bin/hostname` (`hostname_exec_t`)** — `keepalived_t`
+>   may not even stat that binary, so `$(hostname)` inside a notify script
+>   returns empty. This is why `notify.sh` uses the `$HOSTNAME` bash builtin
+>   instead. Fixed at the source; if you see this AVC, the deployed script is
+>   stale.
+> - **`setattr` on `check_nginx.sh` / `notify.sh` (`etc_t`)** — keepalived tries
+>   to set attributes on its scripts and is refused, because installing into
+>   `/etc/keepalived/` labels them `etc_t`. **Benign:** the log will show
+>   `VRRP_Script(check_nginx) succeeded` alongside it, and the notify script
+>   demonstrably runs. Audit noise, not a fault. Left unfixed deliberately —
+>   adding a local policy module to silence a denial that breaks nothing trades
+>   a harmless log line for custom policy nobody will remember writing.
+>
+> What this step is really checking for is a `check_nginx.sh` that *fails* on
+> node2, and that failure does not look like an error: node2 is the backup,
+> holding nothing is its correct state, and a permanently-failing check just
+> means it can never take over. The platform looks healthy right up until the
+> failover you needed does not happen. `VRRP_Script(check_nginx) succeeded` in
+> the journal is the only thing that rules it out.
 
 **Register — last step, and the one that completes the baseline.** On both
 nodes add `keepalived.service` to `HEALTH_SERVICES`, set `HEALTH_VIP` to the
