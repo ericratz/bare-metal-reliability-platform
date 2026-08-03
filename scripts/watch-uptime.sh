@@ -55,6 +55,17 @@ while (( running )); do
     # -w always yields a code; a refused connection or timeout gives 000, which
     # is exactly the case a naive `curl -f` loop would skip over entirely.
     meta=$(curl -s -m "$TIMEOUT" -o "$BODY" -w '%{http_code} %{time_total}' "$URL" 2>/dev/null)
+
+    # Ctrl-C reaches curl, not just this loop. SIGINT goes to the whole
+    # foreground process group, so an interrupt landing mid-request kills curl,
+    # leaves $meta empty, and the 000 guard below scores it a failure — a
+    # fabricated outage, always on the final sample, which flips a clean run to
+    # "Zero-downtime NOT demonstrated" and a non-zero exit. Intermittent by
+    # nature: curl occupies ~10ms of each 200ms cycle, so it bites about one
+    # stop in twenty. It cost the §2 run of 2026-08-03 its headline. If the flag
+    # dropped while curl was in flight, that sample is ours, not the fleet's.
+    (( running )) || break
+
     code="${meta%% *}"
     secs="${meta##* }"
 

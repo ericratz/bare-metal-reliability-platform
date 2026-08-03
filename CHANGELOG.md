@@ -322,6 +322,31 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   out. And the k6 summary writes to `evidence/`, which k6 will not create, so
   step 0 makes the directory first.
 
+- **§2's drain check counted the operator's own traffic as proof the drain had
+  failed.** Steps 3 and 6 ran
+  `tail -20 /var/log/nginx/brp_access.log | grep -c '192.168.71.252'`. The log
+  line is `$remote_addr [...] upstream=$upstream_addr [...]`, so that address
+  matches both when node2 **served** a request and when node2 **sent** one —
+  and node2 is exactly where k6 and several of the runbook's own `curl`
+  commands run. Found in the rehearsal: a correctly drained node2 returned
+  `15`, from client-address lines left by the evening's load tests. The
+  `brp.conf` comment already said `upstream=$upstream_addr` "is the important
+  field: without it the access log cannot prove traffic actually shifted" — the
+  format was designed for this and the check ignored it. Now greps
+  `upstream=192.168.71.252`.
+
+  Step 6 had the same bug pointed the other way and it was the more dangerous
+  of the two: it passes on a **non-zero** count, so client-address lines would
+  have satisfied it while node2 was still out of the pool — a green light to
+  proceed, on the step that returns a node to service.
+
+  Both steps also relied on `tail -20`, which is a line count and not a time
+  window. On a quiet fleet those lines can predate the drain entirely, so a `0`
+  meant "nothing happened recently", not "node2 is receiving nothing" — absence
+  of evidence, standing in for the check you actually want before restarting a
+  service. Both steps now send 20 requests through the VIP first and read only
+  the window that traffic produced, turning each into a positive proof.
+
 - **§2 never said to `git pull` before building, and the omission was invisible
   by construction.** `APP_VERSION` comes from `.env` and is set independently of
   the checkout, so building a stale tree yields an image tagged `0.2.0`, whose
@@ -343,6 +368,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 change per node, so it needs a version with something in it; the honest
 candidate was the defect §1d exposed and the README has been carrying as a
 pending item ever since.
+
+`0.2.0` was deployed to node2 alone, out of the pool, with no load running —
+a rehearsal, not the measured run. It verified against a live Prometheus with
+node1 still on `0.1.0` beside it as a control: `jq` parsed both responses,
+node2 returned a computed `availability_percent` with no `no_data` key while
+node1 returned the same figure from a default it had never computed, and
+`error_rate_percent` was present on one and absent on the other. The two
+nodes' `p95_latency_ms` differed by 4% (8.71 vs 8.40) — separate Prometheus
+instances scraping the same targets at different offsets, which is the
+disagreement the `/slo` docstring predicts and the size that means noise
+rather than a failing scrape.
+
+**`0.2.1` is a version bump with no code change, and that is deliberate.** The
+measured §2 run tests the rollout mechanism, not a payload; a no-op bump
+isolates that variable, so a dropped request can only be the procedure. It is
+also the only way both nodes' versions move in one run, node2 already being on
+`0.2.0` from the rehearsal.
 
 - **`/slo` reported `availability_percent: 100.0` for a fleet that had served
   almost nothing.** `safe_query()` took a per-metric `default` and returned it
@@ -430,6 +472,40 @@ pending item ever since.
   compare while never actually showing it — the Trend was tagged by node and
   therefore just as unreachable.
 
+- **`watch-uptime.sh` fabricated an outage every time you stopped it.**
+  `trap 'running=0' INT TERM` sets the loop flag, but SIGINT goes to the entire
+  foreground process group — so Ctrl-C also kills the in-flight `curl`, `$meta`
+  comes back empty, and the `[[ -z "$code" ]] && code="000"` guard scores that
+  as a failed request. Always the final sample, and enough to flip a clean run
+  to `Zero-downtime NOT demonstrated` with a non-zero exit.
+
+  Intermittent, which is why it survived: `curl` occupies roughly 10ms of each
+  200ms cycle, so an interrupt lands mid-request about one stop in twenty. An
+  earlier 5031-request run this same evening stopped cleanly. It bit the §2
+  run — one reported failure at 23:37:57, two minutes after the rollout had
+  finished, with nginx's access and error logs both silent for that second and
+  k6 running continuously through it. The loop now breaks on an interrupted
+  sample rather than scoring it.
+
+  Worth stating alongside the k6 defect above, because they are mirror images:
+  k6 printed `ZERO DROPPED REQUESTS` for a rollout that never happened, and
+  this invented a drop that never happened. Both instruments were "tested."
+  Neither had been run against a real rolling update on hardware, which is the
+  only thing that exercises the paths where they differ from their own claims.
+
+- **k6's summary briefly claimed it could detect whether a rollout occurred,
+  and it cannot.** A check was added warning when the two nodes served within
+  10% of each other, reasoning that draining a node starves it of ~1200
+  requests per minute. True for one node — but §2 drains *both*, for roughly
+  equal periods, so the shortfalls cancel. A run where nothing was drained
+  measured 9010/8990; a correct rollout measured within a few hundred of even
+  as well. No threshold separates them, so the check fired on correct runs and
+  stayed silent on the failure it was written for. Removed.
+
+  Whether traffic left a node is a question about *time*, and the summary only
+  has totals. The access log has both, and the per-minute breakdown is now
+  printed by the summary as the thing to actually go and check.
+
 `status` deliberately stays `"ok"` when Prometheus answers but every metric is
 null. It reports whether the endpoint could do its job, not whether traffic
 happened to be flowing — the health monitor gates on that field, and a quiet
@@ -441,6 +517,31 @@ request rate below 1 req/s and understates the error rate there. §2 runs at
 20 req/s, well clear of the floor. Noted in the code rather than fixed, because
 the fix is a judgement about what an error rate means at near-zero traffic and
 that deserves its own change.
+
+### Measured
+
+- **§2 executed on hardware: zero dropped requests across a two-node rolling
+  update.** 24,001 requests over 20 minutes at 20 req/s through the VIP,
+  `http_req_failed rate==0`, k6 exit `0`, with `watch-uptime.sh` sampling every
+  200ms in parallel. Both nodes went `0.2.1` → `0.2.2`, each drained, rebuilt,
+  verified directly, and returned to the pool before the other was touched.
+
+  Evidence is the access log, not the totals. Per-minute counts of requests
+  node2 served: ~738 steady, then **309** and **82** across its drain window
+  (23:30:25–23:31:53), then back to 738. And **1498 / 1152** while node1 was
+  out (23:33:57–23:35:32) — node2 carrying the whole fleet at roughly double
+  its share. The partial-minute figures match the drain timestamps to within a
+  few requests, which is what makes them evidence rather than a plausible
+  shape.
+
+  Final split 11947/12054. Near-even is the **expected** result: both nodes are
+  drained for comparable periods, so the shortfalls cancel. That is why the
+  removed heuristic could not work, and why a timestamped source is the only
+  thing that can answer the question.
+
+  The one reported failure came from the watcher's own Ctrl-C (see above) two
+  minutes after the rollout completed, with nginx's access and error logs
+  silent for that second and k6 running continuously through it.
 
 ### Removed
 

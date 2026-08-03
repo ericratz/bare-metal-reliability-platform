@@ -999,12 +999,28 @@ keep the upstream file in sync. Syntax-checks and reloads gracefully.
 ### Step 3 — confirm node2 is receiving nothing
 
 ```bash
-sleep 15
-sudo tail -20 /var/log/nginx/brp_access.log | grep -c '192.168.71.252'   # -> 0
+# on node1: send known-fresh traffic, then check only what it produced
+for i in $(seq 20); do curl -s -o /dev/null http://192.168.71.245/health; done
+sudo tail -20 /var/log/nginx/brp_access.log | grep -c 'upstream=192.168.71.252'   # -> 0
 ```
 
 **Do not continue until this is 0.** Restarting a node still taking traffic is
 the mistake this whole procedure exists to prevent.
+
+> Two things here are deliberate and were both wrong in an earlier version.
+>
+> **`grep` must match `upstream=`, not the bare address.** The log line is
+> `$remote_addr [...] upstream=$upstream_addr [...]`, so `192.168.71.252`
+> appears both when node2 *served* a request and when node2 *sent* one — and
+> node2 is where k6 and the runbook's own `curl` commands run. A bare grep
+> counts your own client traffic as proof the drain failed.
+>
+> **Generate the traffic first.** `tail -20` is a line count, not a time
+> window: on a quiet fleet those lines can all predate the drain, so a `0`
+> would mean "nothing has happened recently", not "node2 is receiving
+> nothing". Absence of evidence is not the check you want before restarting a
+> service. Twenty requests you just sent make the window known-fresh, and turn
+> this into a positive proof that live traffic is landing only on node1.
 
 ### Step 4 — update node2
 
@@ -1033,8 +1049,15 @@ small (proves the container actually restarted, not the old one lingering).
 
 ```bash
 sudo ./scripts/pool.sh up node2
-sleep 15 && sudo tail -50 /var/log/nginx/brp_access.log | grep -c '192.168.71.252'   # -> non-zero
+# on node1, same shape as step 3 — fresh traffic, and match the upstream field
+for i in $(seq 20); do curl -s -o /dev/null http://192.168.71.245/health; done
+sudo tail -20 /var/log/nginx/brp_access.log | grep -c 'upstream=192.168.71.252'   # -> non-zero
 ```
+
+The `upstream=` prefix matters more here than in step 3. This check passes on a
+*non-zero* count, so matching the bare address would let node2's own client
+traffic satisfy it while node2 was still drained — a green light to continue,
+on the step that returns a node to service.
 
 Let it serve a minute; watch terminal A for errors before proceeding. If the new
 version is broken, you find out now, while node1 still runs the old one.

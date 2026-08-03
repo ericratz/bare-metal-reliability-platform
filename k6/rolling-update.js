@@ -122,6 +122,17 @@ export function handleSummary(data) {
     lines.push('      NODE_NAME is wrong on some node; per-node numbers are unsafe.');
   }
 
+  //These totals CANNOT tell you whether a rollout happened, and a previous
+  //version of this file claimed they could — it warned when the two nodes came
+  //within 10% of each other, on the reasoning that draining a node starves it
+  //of ~1200 requests per minute. True for one node. But §2 drains BOTH, for
+  //roughly equal periods, so the two shortfalls cancel and a correct run lands
+  //near-even too: a no-drain run measured 9010/8990, and a correct one 11950/
+  //12050. No threshold separates those. The check fired on correct runs and
+  //stayed silent on the failure it was written for.
+  //
+  //Whether traffic actually left a node is a question about time, and this
+  //summary only has totals. The access log has both — see below.
   if (attributed === 0 && total > 0) {
     //Explicit, because a silently empty section is what this replaced: it read
     //as "nothing to report" when it meant "the reporting broke".
@@ -132,8 +143,16 @@ export function handleSummary(data) {
   }
 
   lines.push('');
-  lines.push('  Both nodes should appear, and each should show a stretch of zero');
-  lines.push('  traffic in the Nginx access log while it was out of the pool.');
+  lines.push('  Both nodes must appear above — but these totals do NOT prove the');
+  lines.push('  rollout happened. A run where nothing was drained looks the same.');
+  lines.push('  Confirm each node has a stretch of zero traffic, on node1:');
+  lines.push('');
+  lines.push("    sudo awk -F'[][]' '/upstream=192.168.71.252/ {print substr($2,1,16)}' \\");
+  lines.push('      /var/log/nginx/brp_access.log | uniq -c | tail -30');
+  lines.push('');
+  lines.push('  Per-minute counts of node2-served requests. The drain window is the');
+  lines.push('  gap. Swap the address for node1. That gap is the evidence; this');
+  lines.push('  summary only proves nothing failed while it was happening.');
 
   return {
     stdout: '\n' + lines.join('\n') + '\n',

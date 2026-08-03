@@ -318,6 +318,25 @@ health monitor now checks every cycle. A request to the VIP traverses the whole
 chain, and returned `node2`, confirming that node1's nginx balances into node2's
 backend.
 
+**`RUNBOOK.md` §2 is executed and measured: zero dropped requests across a
+two-node rolling update.** 24,001 requests over 20 minutes at 20 req/s through
+the VIP, `http_req_failed rate==0`, k6 exit `0`, alongside a second independent
+watcher sampling every 200ms.
+
+The rollout is proven from the access log rather than inferred from totals.
+node2 served **zero** requests from 23:30:25 to 23:31:53 while it was drained
+and rebuilt, then node1 served zero from 23:33:57 to 23:35:32 — visible as
+per-minute counts of 309 and 82 against a steady ~738, and as node2 carrying
+the entire fleet at ~1500/min while node1 was out. Both nodes moved `0.2.1` →
+`0.2.2`, each verified directly while out of the pool, each showing a small
+`uptime_seconds` to prove a real restart rather than a lingering container.
+
+The final split was 11947/12054 — near-even, and that is the *expected* result,
+not a sign nothing happened: a full rolling update drains both nodes for
+comparable periods, so the two shortfalls cancel. Totals cannot demonstrate a
+rollout. Only timestamps can, which is why the access-log breakdown is the
+evidence and k6's number is the claim it supports.
+
 **Both nodes run the monitor and exit 0** with every component registered. That
 number is the deploy's actual output: the registration discipline means a clean
 exit says "this node is healthy as configured" rather than "nothing is being
@@ -362,17 +381,17 @@ not. Details in `CHANGELOG.md`.
 
 Pending:
 
-- [ ] Rolling update (§2) and VIP failover drills (§3) executed and measured on
-      real hardware — the numbers this project exists to produce
+- [ ] VIP failover drills (§3) executed and measured on real hardware — §2 is
+      done; these are the remaining numbers this project exists to produce
 - [ ] SLO numbers are not yet real. `/slo` no longer *fabricates* them — an
       empty window now reports `null` and says which metrics it has no data for,
       instead of the `availability_percent: 100.0` it published throughout §1
       — but null is an honest absence, not a measurement. k6 in §2 is what
       makes them mean something
-- [ ] Per-node p95 from the §2 run will not be a clean number, for two separate
-      reasons: k6 runs on node2, which is also one of the two backends under
+- [ ] Per-node p95 from the §2 run is not a clean number, for two separate
+      reasons: k6 ran on node2, which is also one of the two backends under
       test, and node1 is independently slower to answer off-box requests (see
-      above). The zero-dropped-requests claim is unaffected — it counts failed
+      above). The zero-dropped-requests result is unaffected — it counts failed
       responses, and does not care which host asked
 - [ ] node1's ingress-path latency is diagnosed only by elimination. The app,
       the image, Docker's port publishing and the link are all ruled out by
