@@ -6,6 +6,67 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **The VIP could not fail over at all, and §3 Drill A is what found it.**
+  `check_nginx` tracked with `weight -20` on both nodes. The reasoning in the
+  config was that a failing check drops node1 from 110 to 90, below node2's
+  100, "so the VIP moves." It does not. Per `keepalived.conf(5)`, a non-zero
+  weight *adjusts priority and nothing else* — only weight 0 (the default)
+  transitions the instance to FAULT after `fall` failures. So node1 stayed
+  MASTER at priority 90 and kept advertising, and node2 declined to preempt a
+  lower-priority master because it carries `nopreempt`, which is the one flag
+  whose entire purpose is to decline exactly that. Nothing resigned, so nothing
+  moved. Both halves were individually correct and documented; the defect lived
+  in the interaction.
+
+  Fixed by dropping `weight` from the tracking block on both nodes. A FAULT
+  resignation sends a priority-0 advert, and a backup receiving priority 0
+  promotes itself immediately — that path is evaluated *before* the nopreempt
+  guard, so it is unaffected by it. `nopreempt` keeps doing its real job:
+  stopping a recovered node1 from snatching the VIP back and causing a second
+  outage.
+
+  **Measured, 2026-08-04 01:25:12Z.** `systemctl stop nginx` on node1 (the VIP
+  holder) produced **57 consecutive dropped requests** at the VIP, an unbroken
+  run of `code=000`, **zero VRRP transitions logged on either node**, and no
+  recovery whatsoever until nginx was restarted by hand. Confirmed after the
+  fact by the check in §3: `.251` reported `1` and `.252` reported `0`, so the
+  VIP was still on node1 — and `nopreempt` means it cannot have drifted back,
+  so it never left.
+
+  The `nginx.service` journal accounts for the window with nothing left over:
+
+  | | |
+  |---|---|
+  | `01:25:12.234` | systemd begins stopping nginx |
+  | `01:25:12.242` | first dropped request — **8ms later** |
+  | `01:25:24.171` | operator starts nginx by hand |
+  | `01:25:24.182` | last dropped request |
+  | `01:25:24.213` | nginx `Started` (42ms to come up) |
+
+  So the ~12s is exactly stop-to-start: *the operator's reaction time, not a
+  failover time.* It is quoted nowhere as a metric — the true figure without
+  intervention is unbounded. A side benefit: the watcher's timestamps track
+  systemd's journal to within tens of milliseconds in both directions, which is
+  independent evidence that `watch-uptime.sh` measures what it claims to.
+
+  Three things worth keeping from this:
+
+  - **The health check was never wrong.** `check_nginx.sh` detected the
+    stopped nginx correctly, on schedule, on the right endpoint — its own
+    header warns at length against checks that pass when they should fail. It
+    passed that bar and the VIP still did not move. A health check is only as
+    good as the mechanism it is wired into, and that mechanism had never been
+    exercised.
+  - **A slow failover and no failover look identical from the watcher.** Both
+    are a run of `000` at the VIP. Only the `keepalived-notify` tails
+    distinguish them, which is why §3 now treats tailing *both* nodes as part
+    of the procedure rather than a convenience.
+  - **This is the third instrument-versus-reality gap in the same project**,
+    after k6 reporting a rollout that never happened and `watch-uptime.sh`
+    inventing an outage that never happened. Each was found only by running the
+    thing on hardware. Config that has been read carefully and never executed
+    is not evidence.
+
 - **`notify.sh` logged a different format on each node, and the platform gave
   no sign of it.** This is the file the zero-downtime claim rests on — it
   timestamps every VRRP transition so a failover can be correlated against the
@@ -296,9 +357,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   since a rename in either repo would otherwise flip precedence unannounced.
 
 - **§2 and §3 now say where to run from, and k6 has an install procedure.**
-  Both sections drive traffic at the VIP, which is reachable only from the lab
-  LAN — the workstation is NAT'd off it. Neither section said so, which would
-  have stopped the first measured run at its first command.
+  Both sections drive traffic at the VIP, and neither said where to run from,
+  which would have stopped the first measured run at its first command.
+
+  **The reason first given here was wrong** — "the workstation is NAT'd off the
+  lab LAN" — and is superseded by the workstation-network entry below: it does
+  reach the VIP. The conclusion (run from node2) survives on the replacement
+  reason, the workstation↔node1 stalls. RUNBOOK §1c, §1e, §2 step 0 and §3
+  carried the false reason until 2026-08-03.
 
   **k6 runs on node2**, capped at `MAX_VUS=50`. It is not packaged for Rocky 10;
   installed as a static binary from the upstream release, with the same
@@ -492,6 +558,26 @@ also the only way both nodes' versions move in one run, node2 already being on
   this invented a drop that never happened. Both instruments were "tested."
   Neither had been run against a real rolling update on hardware, which is the
   only thing that exercises the paths where they differ from their own claims.
+
+  **Verified 2026-08-03, with a negative control.** A ~1-in-20 bug cannot be
+  confirmed fixed by stopping the script once, so the window was made
+  deterministic instead: a local server delaying `/health` by 2s against the
+  default 0.2s interval puts `curl` in flight for ~91% of each cycle. Against a
+  copy with the guard line deleted, every mid-`curl` interrupt reproduced the
+  defect — `failed=1`, exit 1, final sample `000`. Against the shipped script,
+  interrupts at 3.0s, 5.2s and 7.4s all gave `failed=0`, exit 0, with the
+  interrupted sample correctly absent from the log rather than scored. The
+  inter-request sleep window (50ms `curl`, 3s interval) is clean on both, which
+  places the defect precisely in the `curl` window and confirms the guard does
+  not disturb the path that already worked. Then live: 30s at the VIP, **117/117
+  succeeded**, exit 0, attribution node2 60 / node1 57.
+
+  One trap for anyone re-running this: reproducing a terminal Ctrl-C requires
+  `kill -INT` to the *process group*, and the harness must enable job control
+  (`set -m`). Bash starts background jobs with SIGINT set to `SIG_IGN` when job
+  control is off, and a child can never re-trap a signal ignored at exec — the
+  first attempt sent SIGINTs that were silently discarded and the script ran on
+  forever. A harness with that flaw passes the broken script too.
 
 - **k6's summary briefly claimed it could detect whether a rollout occurred,
   and it cannot.** A check was added warning when the two nodes served within

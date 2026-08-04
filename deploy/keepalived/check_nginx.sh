@@ -3,8 +3,14 @@
 # /etc/keepalived/check_nginx.sh
 #
 # keepalived vrrp_script health check. Exit 0 = this node's Nginx is serving;
-# non-zero = it is not, and keepalived subtracts `weight` from this node's
-# VRRP priority, handing the VIP to the peer.
+# non-zero = it is not, and after `fall` consecutive failures keepalived puts
+# this node's VRRP instance into FAULT, which resigns the VIP to the peer.
+#
+# FAULT, not a priority adjustment. The tracking block deliberately carries no
+# `weight` — see keepalived-node1.conf. With a weight this check ran correctly,
+# reported failure correctly, and still could not move the VIP, because a
+# priority change is not a state change. A health check is only as good as what
+# it is wired into.
 #
 # Deliberately hits /nginx-health, which Nginx answers itself and never
 # proxies. Two failure modes this avoids:

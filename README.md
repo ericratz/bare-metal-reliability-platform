@@ -129,6 +129,15 @@ Three design decisions that are easy to get wrong, and were:
   preemption whether you want it or not — meaning a recovering node yanks the
   VIP back and causes a *second* outage during recovery. Two BACKUPs elect the
   same winner and honor `nopreempt`.
+- **`nopreempt` has a price, and `check_nginx` is tracked with no `weight` to
+  pay it.** A weighted track script only *adjusts priority*; it never changes
+  state. A `nopreempt` peer, by definition, will not take over from a
+  lower-priority master — so weight-based tracking and `nopreempt` cancel each
+  other out exactly, and the VIP cannot move. Omitting `weight` selects FAULT
+  mode, where a failing check makes the node resign with a priority-0 advert,
+  which a backup honors regardless of `nopreempt`. This was not reasoned out in
+  advance; it was found by §3 Drill A failing on hardware, with 57 dropped
+  requests and no VRRP transition on either node. See `CHANGELOG.md`.
 - **Failover is measured, not asserted.** `notify.sh` logs every VRRP
   transition with a millisecond timestamp; cross-referenced against
   `scripts/watch-uptime.sh` it yields a real number — "the VIP moved at

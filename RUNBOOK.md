@@ -326,8 +326,8 @@ rather than an oversight:
 
 **Validate the config before installing it.** §1c is gated on this because
 `brp.conf` changes between deploys and a bad one takes ingress down on the node
-you are standing on. The workstation is NAT'd off the lab LAN and has no docker
-daemon, so run it on node1:
+you are standing on. The workstation has no docker daemon — only the Docker
+Desktop client shim, no `dockerd` and no socket — so run it on node1:
 
 ```bash
 cd ~/bare-metal-reliability-platform
@@ -802,9 +802,11 @@ to whichever node the switch's ARP cache learned last, so it will *appear* to
 work intermittently. Stop keepalived on node2 and fix the firewall before
 continuing.
 
-**Verify the VIP actually serves — run from a node, not the workstation.** The
-workstation is NAT'd off this LAN, so it cannot reach `.245` at all and a
-failure there means nothing:
+**Verify the VIP actually serves.** This one does work from the workstation —
+it routes to the lab LAN and reaches `.245` in ~15ms, so a failure here is a
+real failure, not an artifact of where you ran it. What still must run on a
+node is anything at layer 2 (`arping`, `ip neigh`, duplicate-address checks),
+which does not survive the routed hop:
 
 ```bash
 curl -s http://192.168.71.245/health | jq '{node, status}'
@@ -941,9 +943,11 @@ layout is upstream's to change, and this is the one step here that depends on it
 
 ### Step 0 — start evidence collection (before touching anything)
 
-**Both of these run on node2, not on your workstation.** They drive traffic at
-the VIP, and the workstation is NAT'd off the lab LAN — it cannot reach
-`192.168.71.245` at all. Two SSH sessions to node2:
+**Both of these run on node2, not on your workstation.** Not because the
+workstation cannot reach the VIP — it can — but because it is a poor load
+generator: the workstation↔node1 path has episodic ~400ms stalls (see
+`CHANGELOG.md`), and a load generator whose own path stalls cannot distinguish
+its jitter from the fleet's. Two SSH sessions to node2:
 
 ```bash
 ssh ericratz@192.168.71.252
@@ -1129,10 +1133,17 @@ Roll back the node you just touched **before** proceeding to the other.
 
 These prove the HA layer works and, more usefully, *measure* it.
 
-**Run the watcher from node2, for the same reason as §2 step 0** — it targets
-the VIP, and the workstation cannot reach it. node2 is also the only correct
-choice here regardless: every drill below takes node1 down in some fashion, and
-a watcher running on the node you are about to power off measures nothing.
+**Run the watcher from node2.** Not because the workstation cannot reach the
+VIP — it can, and unlike the direct workstation↔node1 path the VIP stays clean
+(keepalived gratuitously ARPs it continuously, so that neighbour entry never
+goes stale). node2 is the right choice for a blunter reason: every drill below
+takes node1 down in some fashion, and a watcher running on the node you are
+about to power off measures nothing.
+
+A second watcher on the workstation is worth running alongside it. It is the
+only vantage point that is not one of the two nodes, so it sees the failover
+the way an external client does — and during Drill B it is the only watcher
+whose own host is not the surviving node.
 
 ```bash
 # on node2, for the whole of every drill
@@ -1157,17 +1168,47 @@ identical format on both, which it did not before §1e — see `CHANGELOG.md`.
 sudo systemctl stop nginx
 ```
 
-Expected: `check_nginx.sh` fails twice (~4s), node1's priority drops below
-node2's, VIP moves to node2, `notify.sh` logs `state=MASTER` on node2. Measure
-dropped requests in terminal A against the transition timestamp. Restart nginx
-on node1 — with `nopreempt`, the VIP **stays** on node2 (no second outage).
+Expected: `check_nginx.sh` fails twice (~4s), node1's instance enters FAULT and
+resigns with a priority-0 advert, node2 promotes and `notify.sh` logs
+`state=MASTER` on node2. Measure dropped requests in terminal A against that
+transition timestamp. Restart nginx on node1 — with `nopreempt`, the VIP
+**stays** on node2 (no second outage), and node1 returns as BACKUP.
+
+> **This drill failed the first time it was run, on 2026-08-04, and that is
+> why the config above says `fall`/`rise` with no `weight`.** The original
+> tracking block used `weight -20`, on the reasoning that dropping node1 from
+> 110 to 90 puts it under node2's 100. A non-zero weight only adjusts
+> priority; it never changes state. node1 stayed MASTER at 90, kept
+> advertising, and node2 — which carries `nopreempt` — declined to preempt a
+> lower-priority master, because that is precisely what `nopreempt` means.
+>
+> Result: **57 consecutive dropped requests, zero VRRP transitions on either
+> node, and no recovery at all** until nginx was restarted by hand. The VIP sat
+> on the one node known to be unable to serve. If you see an unbroken run of
+> `code=000` at the VIP with both `journalctl -t keepalived-notify` tails
+> silent, that is this bug, not a slow failover — the two are
+> indistinguishable from the watcher alone, which is why both tails are part of
+> the procedure rather than a nicety.
+>
+> The measured outage that day was ~12s, and **that number is not a failover
+> time.** The `nginx.service` journal showed the first drop 8ms after systemd
+> began stopping and the last 31ms before it reported `Started` again, so the
+> window is exactly stop-to-manual-restart. Do not quote it. Confirmed with the
+> VIP-location check below: `.251` → `1`, `.252` → `0`, and `nopreempt` means
+> it cannot have drifted back, so it never left.
 
 ### Drill B — hard power loss on the master
 
 Pull power from the VIP holder. Expected: node2 stops hearing adverts, promotes
-itself after ~3–4s, VIP moves. This is the ungraceful path — slower than Drill A
-because it waits for advert timeout rather than a priority change. Record the
-gap.
+itself after the master-down interval, VIP moves. Record the gap.
+
+Do **not** assume this is slower than Drill A — the old text here said so, on
+the pre-2026-08-04 assumption that Drill A moved the VIP by priority change.
+The two are now close enough that the ordering is an open question worth
+measuring: Drill A costs `fall × interval` to detect (2–4s) and then resigns
+immediately, while Drill B costs `3 × advert_int + (256 − priority)/256`, about
+3.6s on node2, with nothing to detect. Drill B may well be the faster of the
+two. Whichever it is, it is a measurement, not a prediction.
 
 ### Drill C — split brain (cause it once, on purpose)
 
