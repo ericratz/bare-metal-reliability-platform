@@ -390,8 +390,16 @@ not. Details in `CHANGELOG.md`.
 
 Pending:
 
-- [ ] VIP failover drills (§3) executed and measured on real hardware — §2 is
-      done; these are the remaining numbers this project exists to produce
+- [x] **§3 Drill A (graceful nginx stop) executed and measured** — and it
+      failed the first time, which is the finding: a weighted `track_script`
+      and `nopreempt` cancel out exactly, so the VIP could not move at all.
+      57 dropped requests, zero VRRP transitions, no recovery without manual
+      intervention. After switching to FAULT-mode tracking: **failover in
+      ~3.06s, 13 dropped requests**, and a recovery leg that dropped nothing
+      across 9,884 requests. See `CHANGELOG.md`.
+- [ ] §3 Drills B (hard power loss) and C (split brain) — still to run. Note
+      Drill B's stated "slower than Drill A" is now an open question, not a
+      prediction; see `RUNBOOK.md` §3
 - [ ] SLO numbers are not yet real. `/slo` no longer *fabricates* them — an
       empty window now reports `null` and says which metrics it has no data for,
       instead of the `availability_percent: 100.0` it published throughout §1

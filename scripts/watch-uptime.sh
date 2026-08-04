@@ -47,7 +47,18 @@ printf '# watching %s every %ss\n' "$URL" "$INTERVAL" | tee "$OUT"
 printf '# %-24s %-6s %-10s %s\n' "timestamp" "code" "seconds" "node" | tee -a "$OUT"
 
 while (( running )); do
-    ts=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
+    # %N then truncate, NOT %3N — the identical fix already in notify.sh, which
+    # was never propagated here. uutils `date` (Ubuntu 26.04, and the WSL2
+    # workstation) ignores the width modifier on %3N *and* drops zero-padding:
+    # 0.060509992s prints as "60509992". Wrong width, and worse, the missing
+    # leading zero makes that sample sort AFTER one taken 250ms later, so the
+    # evidence log reads as though time ran backwards — about one sample in ten,
+    # whenever nanoseconds land under 0.1s. Rocky's GNU date is unaffected, so
+    # the two nodes silently produced different formats from the same script.
+    # %N is zero-padded to 9 digits by both implementations; truncating in bash
+    # is therefore byte-identical on each.
+    ts=$(date -u +%Y-%m-%dT%H:%M:%S.%N)
+    ts="${ts:0:23}Z"
 
     # Body goes to a file so stdout carries ONLY the -w metadata. Parsing both
     # out of one stream with tail/cut misreads any response whose body line

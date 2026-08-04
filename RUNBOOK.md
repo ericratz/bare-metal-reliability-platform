@@ -1197,6 +1197,20 @@ transition timestamp. Restart nginx on node1 — with `nopreempt`, the VIP
 > VIP-location check below: `.251` → `1`, `.252` → `0`, and `nopreempt` means
 > it cannot have drifted back, so it never left.
 
+**Measured result, with FAULT mode installed (2026-08-04 01:39:55Z):**
+`state=FAULT` on the failing node **3.09s** after `systemctl stop nginx`
+(`fall 2 × interval 2`), the peer promoted, and traffic resumed after
+**~3.06s and 13 dropped requests** at 5 req/s. The recovery leg — restarting
+nginx on the failed node — **dropped nothing**: 9,884 consecutive successes
+from an external watcher spanning the restart, with the VIP correctly staying
+put. That is `nopreempt` doing its job, measured.
+
+> **Do not compute the failover time from `notify.sh` alone.** keepalived forks
+> the notify script *after* the transition, so its timestamp lags the VIP
+> actually moving — by ~350ms in the run above, where traffic had resumed by
+> `01:39:59.14` but `state=MASTER` was not logged until `01:39:59.498`. Use the
+> watcher's first recovered request for *when*, and notify for *which node*.
+
 ### Drill B — hard power loss on the master
 
 Pull power from the VIP holder. Expected: node2 stops hearing adverts, promotes

@@ -67,6 +67,64 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     thing on hardware. Config that has been read carefully and never executed
     is not evidence.
 
+  **Verified on hardware the same night, 2026-08-04 01:39:55Z.** With FAULT
+  mode installed, activation left node2 MASTER, so the drill ran in the
+  reverse direction — `systemctl stop nginx` on node2, expecting the VIP to
+  move to node1. It did:
+
+  | | |
+  |---|---|
+  | `01:39:55.834` | node2 systemd begins stopping nginx |
+  | `01:39:55.832` | first dropped request (node1's watcher; ~2ms cross-node skew) |
+  | `01:39:58.919` | node2 logs `state=FAULT` — **3.09s**, i.e. `fall 2 × interval 2` |
+  | `01:39:58.891` | last dropped request |
+  | `~01:39:59.14` | traffic resumes |
+  | `01:39:59.498` | node1 logs `state=MASTER` |
+
+  **13 dropped requests, outage ~3.06s** (3.06–3.31s bounded by adjacent good
+  samples), 733/746 succeeded over the run. Predicted beforehand as 2–4s and
+  10–20 requests, on the arithmetic of the timers; both held, which is the
+  point of writing predictions down first.
+
+  **The recovery leg dropped nothing at all.** nginx restarted on node2 at
+  `01:41:13.425`; node2 returned to `state=BACKUP` at `01:41:16.925` (3.5s,
+  `rise 2 × interval 2`) and the VIP stayed on node1. Measured from a *third*
+  vantage — a watcher on the workstation, neither of the two nodes — running
+  `01:40:54`–`02:22`: **9,884 requests, zero failures**, 21 consecutive 200s
+  spanning the restart window. `nopreempt`'s "no second outage during recovery"
+  is now measured rather than asserted. That run also splits 4937/4947 across
+  the two backends, an independent 1:1 confirmation of the LB weighting.
+
+  One caveat for anyone computing failover times from `notify.sh` alone:
+  **its timestamps lag the actual transition.** Traffic resumed by ~`01:39:59.14`
+  but node1 did not log `state=MASTER` until `01:39:59.498` — keepalived forks
+  the notify script *after* the state change, so ~350ms of fork/exec/logger
+  latency sits between the VIP moving and the line appearing. Failover computed
+  from notify alone overstates by roughly 10% here. The watcher's first
+  recovered request is the better figure for service restoration; use notify to
+  identify *which* node took over, not precisely when.
+
+- **`watch-uptime.sh` wrote corrupt timestamps on node1 and on the
+  workstation** — the same `%3N` defect fixed in `notify.sh` during §1e, never
+  propagated to the sibling script, and found by reading Drill A's raw output.
+  uutils `date` 0.8.0 (Ubuntu 26.04, and WSL2) ignores the width modifier on
+  `%3N` *and* drops zero-padding, so `0.060509992s` prints as `60509992`:
+  wrong width, and the missing leading zero makes that sample sort *after* one
+  taken 250ms later. About one sample in ten, whenever nanoseconds land under
+  0.1s. Rocky's GNU `date` is unaffected, so the two nodes silently produced
+  different formats from one script — and the evidence log, the artifact the
+  whole zero-downtime claim rests on, read as though time ran backwards.
+
+  Now uses `%N` plus a bash truncation, exactly as `notify.sh` does; `%N` is
+  zero-padded to 9 digits by both implementations, so the result is
+  byte-identical on each. Verified: uniform 24-character timestamps, log order
+  identical to sorted order, leading zeros intact.
+
+  Two of Drill A's thirteen failure timestamps were affected and appear out of
+  order in that run's log. The measurement is unharmed — both outage endpoints
+  landed above 0.1s — but it was close, and the corruption was only caught
+  because the inter-sample deltas stopped making sense on inspection.
+
 - **`notify.sh` logged a different format on each node, and the platform gave
   no sign of it.** This is the file the zero-downtime claim rests on — it
   timestamps every VRRP transition so a failover can be correlated against the
